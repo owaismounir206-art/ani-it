@@ -11,19 +11,22 @@ from ani_it.config import Config, load_config
 from ani_it.constants import (
     APP_NAME,
     APP_VERSION,
+    FORMAT_MP4,
     Colors,
     Icons,
 )
 from ani_it.downloader import DownloaderManager
 from ani_it.history import HistoryManager
 from ani_it.player import MpvController
+from ani_it.preview import render_preview
 from ani_it.resolver import StreamResolver
-from ani_it.scraper import AnimeUnityScraper
+from ani_it.scraper import AnimeUnityScraper, EpisodesNotFoundError
 from ani_it.ui import FzfUI
 from ani_it.utils import (
     SignalHandler,
+    format_duration,
     get_cache_dir,
-    sanitize_filename,
+    normalize_episode_number,
 )
 
 
@@ -131,20 +134,262 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Sotto questa soglia (secondi) una posizione non vale la pena di essere ripresa
+MIN_SAVED_POSITION = 5.0
+
+
+def find_episode_index(episodes: list[dict[str, Any]], target: Any, allow_position: bool = True) -> Optional[int]:
+    """Indice dell'episodio richiesto: prima per numero reale su tutta la lista, poi per posizione.
+
+    La posizione (1-based) è solo un ripiego: con un episodio 0 o numerazioni che non
+    partono da 1 confonderla con il numero farebbe avviare l'episodio sbagliato.
+    """
+    wanted = normalize_episode_number(target)
+    if wanted is None:
+        return None
+    for idx, episode in enumerate(episodes):
+        if normalize_episode_number(episode.get("number")) == wanted:
+            return idx
+    if allow_position and isinstance(wanted, int) and 1 <= wanted <= len(episodes):
+        return wanted - 1
+    return None
+
+
+def record_progress(
+    history: HistoryManager,
+    anime_id: Any,
+    title: str,
+    slug: str,
+    episodes: list[dict[str, Any]],
+    idx: int,
+    playback: Any,
+) -> None:
+    """Salva in cronologia l'esito di una visione: numero reale, fine episodio/serie, posizione."""
+    number = normalize_episode_number(episodes[idx].get("number"))
+    if number is None:
+        number = idx + 1
+    finished = playback.status == "completed"
+    position = 0.0 if finished or playback.time_pos < MIN_SAVED_POSITION else playback.time_pos
+    history.update_progress(
+        anime_id=anime_id,
+        title=title,
+        slug=slug,
+        episode=number,
+        total_episodes=len(episodes),
+        episode_completed=finished,
+        series_completed=finished and idx == len(episodes) - 1,
+        position=position,
+    )
+
+
+def resume_position(entry: Optional[dict[str, Any]], episode: dict[str, Any]) -> float:
+    """Posizione da cui riprendere `episode`: solo se è l'episodio interrotto in cronologia."""
+    if not entry or entry.get("episode_completed"):
+        return 0.0
+    number = normalize_episode_number(episode.get("number"))
+    saved = normalize_episode_number(entry.get("last_episode"))
+    if number is None or saved is None or number != saved:
+        return 0.0
+    try:
+        position = float(entry.get("last_position") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return position if position >= MIN_SAVED_POSITION else 0.0
+
+
+def _warn(message: str) -> None:
+    sys.stdout.write(f"{Colors.BRIGHT_YELLOW}{Icons.WARNING} {message}{Colors.RESET}\n")
+
+
+def _step(idx: int, delta: int, total: int) -> Optional[int]:
+    """Nuovo indice dopo uno spostamento; None (con avviso) se esce dalla lista."""
+    new_idx = idx + delta
+    if 0 <= new_idx < total:
+        return new_idx
+    _warn("Sei all'ultimo episodio della serie!" if delta > 0 else "Sei al primo episodio della serie!")
+    return None
+
+
+def _choose_episode(ui: FzfUI, title: str, episodes: list[dict[str, Any]], anime_id: Any) -> Optional[int]:
+    picked = ui.select_episode(title, episodes, anime_id)
+    return episodes.index(picked) if picked else None
+
+
+def _run_player(
+    player: MpvController,
+    stream_data: dict[str, Any],
+    title: str,
+    ep_num: Any,
+    start_at: float,
+    quit_on_eof: bool,
+) -> Any:
+    """Avvia mpv; se il player non è installato mostra il messaggio ed esce con codice 1."""
+    try:
+        return player.play(
+            stream_data=stream_data,
+            anime_title=title,
+            episode_number=ep_num,
+            start_time=start_at or None,
+            quit_on_eof=quit_on_eof,
+        )
+    except FileNotFoundError as exc:
+        sys.stderr.write(f"{Colors.BRIGHT_RED}{Icons.ERROR} {exc}{Colors.RESET}\n")
+        sys.exit(1)
+
+
+def _playback_error_message(title: str, ep_num: Any, playback: Any) -> str:
+    message = f"mpv non è riuscito a riprodurre '{title}' - Episodio {ep_num}."
+    if playback.error_output:
+        message += f"\n{Colors.DIM}{playback.error_output}{Colors.RESET}"
+    return message
+
+
+def play_episodes(
+    *,
+    config: Config,
+    ui: FzfUI,
+    history: HistoryManager,
+    resolver: StreamResolver,
+    player: MpvController,
+    downloader: DownloaderManager,
+    title: str,
+    anime_id: Any,
+    slug: str,
+    episodes: list[dict[str, Any]],
+    start_idx: int,
+) -> None:
+    """Loop interattivo di riproduzione e download, come piccola macchina a stati.
+
+    Stati: play -> post_watch | error; post_watch -> play | download | uscita;
+    download -> post_download | error; post_download -> play_local | download | play;
+    play_local -> post_watch | error; error -> (stato da ritentare) | play | download.
+    """
+    total = len(episodes)
+    idx = start_idx
+    state = "play"
+    error_message = ""
+    retry_state = "play"   # stato a cui torna "Riprova" dal menu di errore
+    skip_resume = False
+
+    while True:
+        episode = episodes[idx]
+        ep_num = episode["number"]
+        has_next = idx + 1 < total
+        has_prev = idx > 0
+
+        if state == "play":
+            sys.stdout.write(
+                f"\n{Colors.BRIGHT_CYAN}{Icons.PLAY} Risoluzione stream: {title} - Episodio {ep_num}...{Colors.RESET}\n"
+            )
+            try:
+                stream_data = resolver.resolve(
+                    episode["link"],
+                    quality=config.general.quality,
+                    episode_id=episode.get("id"),
+                )
+            except Exception as exc:
+                error_message, retry_state, state = f"Impossibile risolvere lo stream: {exc}", "play", "error"
+                continue
+
+            start_at = 0.0 if skip_resume else resume_position(history.get_anime_history(anime_id), episode)
+            skip_resume = False
+            if start_at > 0:
+                sys.stdout.write(f"{Colors.DIM}Riprendo da {format_duration(start_at)}{Colors.RESET}\n")
+
+            playback = _run_player(player, stream_data, title, ep_num, start_at, config.general.auto_next)
+            if playback.status == "error":
+                error_message = _playback_error_message(title, ep_num, playback)
+                retry_state, state = "play", "error"
+                continue
+
+            record_progress(history, anime_id, title, slug, episodes, idx, playback)
+            if config.general.auto_next and playback.status == "completed" and has_next:
+                sys.stdout.write(
+                    f"\n{Colors.BRIGHT_GREEN}{Icons.ARROW_RIGHT} Riproduzione automatica prossimo episodio...{Colors.RESET}\n"
+                )
+                idx += 1
+                continue
+            state = "post_watch"
+
+        elif state in ("post_watch", "error"):
+            if state == "post_watch":
+                action = ui.post_watch_menu(ep_num, has_next=has_next, has_prev=has_prev)
+            else:
+                action = ui.error_menu(ep_num, error_message, has_next=has_next, has_prev=has_prev)
+
+            if action == "retry":
+                state = retry_state
+            elif action == "replay":
+                skip_resume, state = True, "play"
+            elif action in ("next", "prev"):
+                new_idx = _step(idx, 1 if action == "next" else -1, total)
+                if new_idx is not None:
+                    idx, state = new_idx, "play"
+            elif action == "select":
+                new_idx = _choose_episode(ui, title, episodes, anime_id)
+                if new_idx is not None:
+                    idx, state = new_idx, "play"
+            elif action == "download":
+                state = "download"
+            else:  # quit
+                return
+
+        elif state == "download":
+            ok = downloader.download_episode(title, ep_num, episode["link"], episode_id=episode.get("id"))
+            if ok:
+                state = "post_download"
+            else:
+                error_message = f"Download dell'episodio {ep_num} non riuscito."
+                retry_state, state = "download", "error"
+
+        elif state == "post_download":
+            action = ui.post_download_menu(ep_num, has_next=has_next, has_prev=has_prev)
+            if action == "play":
+                state = "play_local"
+            elif action == "next":
+                new_idx = _step(idx, 1, total)
+                if new_idx is not None:
+                    idx, state = new_idx, "download"
+            elif action == "select":
+                new_idx = _choose_episode(ui, title, episodes, anime_id)
+                if new_idx is not None:
+                    idx, state = new_idx, "play"
+            else:  # quit
+                return
+
+        elif state == "play_local":
+            path = downloader.episode_path(title, ep_num)
+            if not path.exists():
+                error_message = f"File scaricato non trovato: {path}"
+                retry_state, state = "download", "error"
+                continue
+            local_stream = {"stream_url": str(path), "headers": {}, "format": FORMAT_MP4, "subtitles": []}
+            playback = _run_player(player, local_stream, title, ep_num, 0.0, False)
+            if playback.status == "error":
+                error_message = _playback_error_message(title, ep_num, playback)
+                retry_state, state = "play_local", "error"
+                continue
+            record_progress(history, anime_id, title, slug, episodes, idx, playback)
+            state = "post_watch"
+
+
 def main() -> None:
     """Punto di ingresso principale della CLI."""
     SignalHandler.install()
-    config: Config = load_config()
-    history = HistoryManager()
-    ui = FzfUI(config, history)
 
+    # Il parsing viene prima di tutto: --help, --version e gli errori di sintassi escono qui
+    # senza aver creato config, cronologia o cache.
     parser = create_parser()
     args = parser.parse_args()
 
-    # 1. Gestione comando interno di preview per fzf
+    # 1. Gestione comando interno di preview per fzf (leggero: niente cronologia né UI)
     if args.preview_anime_id:
-        ui.render_anime_preview(args.preview_anime_id)
+        render_preview(args.preview_anime_id, load_config(warn=lambda message: None).general.preview_art)
         sys.exit(0)
+
+    config: Config = load_config()
+    history = HistoryManager()
+    ui = FzfUI(config, history)
 
     # 2. Gestione comando interno per completamento shell
     if args.list_history_titles:
@@ -177,13 +422,15 @@ def main() -> None:
     # Banner introduttivo moderno
     ui.print_banner()
 
-    scraper = AnimeUnityScraper()
-    resolver = StreamResolver(session=scraper.session)
+    base_url = config.general.base_url
+    scraper = AnimeUnityScraper(base_url=base_url)
+    resolver = StreamResolver(session=scraper.session, base_url=base_url)
     player = MpvController(config)
     downloader = DownloaderManager(config, scraper=scraper, resolver=resolver)
 
     selected_anime: Optional[dict[str, Any]] = None
     target_episode_num: Optional[Any] = args.episode
+    resume_info: Optional[dict[str, Any]] = None
 
     # 5. Modalità Riprendi (--continue)
     if args.resume:
@@ -198,11 +445,8 @@ def main() -> None:
                 "title": last["title"],
                 "slug": last["slug"],
             }
-            last_ep = last.get("last_episode", 1)
-            if last.get("completed", False):
-                target_episode_num = str(last_ep + 1)
-            else:
-                target_episode_num = str(last_ep)
+            resume_info = last
+            target_episode_num = None  # l'episodio si ricava dalla cronologia dopo aver letto la lista
 
     # 6. Modalità Cronologia (--history)
     elif args.history:
@@ -222,7 +466,7 @@ def main() -> None:
                 "type": "HIST",
                 "year": "Recente",
                 "episodes_count": str(h.get("total_episodes", "?")),
-                "status": "Completato" if h.get("completed") else f"Ep. {h.get('last_episode')}",
+                "status": "Completato" if h.get("series_completed") else f"Ep. {h.get('last_episode')}",
                 "plot": f"Ultima visione: Episodio {h.get('last_episode')}",
             })
         selected_anime = ui.select_anime(anime_items)
@@ -250,8 +494,8 @@ def main() -> None:
             results = scraper.search_anime(query)
         except requests.exceptions.ConnectionError as exc:
             sys.stderr.write(
-                f"\n  {Colors.BRIGHT_RED}{Icons.ERROR} Errore di connessione ad AnimeUnity.{Colors.RESET}\n"
-                f"  {Colors.DIM}Verifica la connessione internet o lo stato dei server (https://www.animeunity.so){Colors.RESET}\n"
+                f"\n  {Colors.BRIGHT_RED}{Icons.ERROR} Errore di connessione ad AnimeUnity: {exc}{Colors.RESET}\n"
+                f"  {Colors.DIM}Verifica la connessione internet o lo stato dei server ({base_url}){Colors.RESET}\n"
             )
             query = None
             continue
@@ -281,6 +525,9 @@ def main() -> None:
     sys.stdout.write(f"{Colors.BRIGHT_CYAN}{Icons.FILM} Caricamento episodi per '{title}'...{Colors.RESET}\n")
     try:
         details = scraper.get_anime_details(aid, slug)
+    except EpisodesNotFoundError:
+        sys.stderr.write(f"{Colors.BRIGHT_RED}{Icons.ERROR} Nessun episodio disponibile per questa serie.{Colors.RESET}\n")
+        sys.exit(1)
     except Exception as exc:
         sys.stderr.write(f"{Colors.BRIGHT_RED}{Icons.ERROR} Errore nel caricamento della scheda anime: {exc}{Colors.RESET}\n")
         sys.exit(1)
@@ -289,6 +536,10 @@ def main() -> None:
     if not episodes:
         sys.stderr.write(f"{Colors.BRIGHT_RED}{Icons.ERROR} Nessun episodio disponibile per questa serie.{Colors.RESET}\n")
         sys.exit(1)
+
+    if details.get("partial"):
+        reason = details.get("partial_reason") or "errore di rete"
+        _warn(f"Lista episodi incompleta ({reason}): alcuni episodi potrebbero mancare.")
 
     total_episodes = len(episodes)
 
@@ -308,162 +559,48 @@ def main() -> None:
                 sys.exit(0)
             range_val = user_range if user_range else "all"
 
-        downloader.download_range(aid, slug, range_val)
+        # I dettagli già caricati e il titolo mostrato nei menu vengono riusati: niente doppio
+        # download della scheda e stessa cartella dei download lanciati dal menu.
+        downloader.download_range(aid, slug, range_val, details=details, anime_title=title)
         sys.exit(0)
 
-    # 10. Modalità Streaming / Riproduzione (Loop interattivo)
-    # Trova l'indice dell'episodio di partenza
-    current_idx = 0
-    if target_episode_num is not None:
-        matched = False
-        target_str = str(target_episode_num).strip()
-        for idx, ep in enumerate(episodes):
-            if str(ep.get("number")).strip() == target_str or str(idx + 1) == target_str:
-                current_idx = idx
-                matched = True
-                break
-        if not matched:
-            sys.stdout.write(
-                f"{Colors.BRIGHT_YELLOW}{Icons.WARNING} Episodio {target_episode_num} non trovato, selezione manuale...{Colors.RESET}\n"
-            )
-            selected_ep = ui.select_episode(title, episodes, aid)
-            if not selected_ep:
-                sys.exit(0)
-            current_idx = episodes.index(selected_ep)
-    else:
-        selected_ep = ui.select_episode(title, episodes, aid)
-        if not selected_ep:
+    # 10. Modalità Streaming / Riproduzione: scelta dell'episodio di partenza
+    start_idx: Optional[int] = None
+    if resume_info is not None:
+        last_num = resume_info.get("last_episode")
+        found = find_episode_index(episodes, last_num, allow_position=False)
+        if found is None:
+            _warn(f"Ultimo episodio visto ({last_num}) non trovato nella lista, selezione manuale...")
+        elif resume_info.get("episode_completed"):
+            if found + 1 < total_episodes:
+                start_idx = found + 1
+            else:
+                _warn(f"Hai già completato l'ultimo episodio ({last_num}): serie terminata. Scegli cosa rivedere.")
+        else:
+            start_idx = found
+    elif target_episode_num is not None:
+        start_idx = find_episode_index(episodes, target_episode_num)
+        if start_idx is None:
+            _warn(f"Episodio {target_episode_num} non trovato, selezione manuale...")
+
+    if start_idx is None:
+        start_idx = _choose_episode(ui, title, episodes, aid)
+        if start_idx is None:
             sys.exit(0)
-        current_idx = episodes.index(selected_ep)
 
-    # Loop continuo di riproduzione
-    while 0 <= current_idx < len(episodes):
-        current_ep = episodes[current_idx]
-        ep_num = current_ep["number"]
-        ep_link = current_ep["link"]
-        ep_id = current_ep.get("id")
-
-        sys.stdout.write(
-            f"\n{Colors.BRIGHT_CYAN}{Icons.PLAY} Risoluzione stream: {title} - Episodio {ep_num}...{Colors.RESET}\n"
-        )
-        try:
-            stream_data = resolver.resolve(
-                ep_link,
-                quality=config.general.quality,
-                episode_id=ep_id,
-            )
-        except Exception as exc:
-            sys.stderr.write(f"{Colors.BRIGHT_RED}{Icons.ERROR} Impossibile risolvere lo stream: {exc}{Colors.RESET}\n")
-            action = ui.post_watch_menu(ep_num, has_next=(current_idx + 1 < len(episodes)), has_prev=(current_idx > 0))
-            if action == "next":
-                current_idx += 1
-                continue
-            elif action == "prev":
-                current_idx -= 1
-                continue
-            elif action == "select":
-                new_ep = ui.select_episode(title, episodes, aid)
-                if new_ep:
-                    current_idx = episodes.index(new_ep)
-                    continue
-                break
-            else:
-                break
-
-        # Avvio di MPV
-        playback = player.play(
-            stream_data=stream_data,
-            anime_title=title,
-            episode_number=ep_num,
-        )
-
-        # Aggiornamento cronologia atomica
-        is_completed = (playback.status == "completed")
-        history.update_progress(
-            anime_id=aid,
-            title=title,
-            slug=slug,
-            episode=int(float(ep_num)) if str(ep_num).replace(".", "").isdigit() else (current_idx + 1),
-            total_episodes=total_episodes,
-            completed=is_completed,
-        )
-
-        has_next = current_idx + 1 < len(episodes)
-        has_prev = current_idx > 0
-
-        # Se auto_next è abilitato e la visione è stata completata
-        if config.general.auto_next and is_completed and has_next:
-            sys.stdout.write(f"\n{Colors.BRIGHT_GREEN}{Icons.ARROW_RIGHT} Riproduzione automatica prossimo episodio...{Colors.RESET}\n")
-            current_idx += 1
-            continue
-
-        # Menu interattivo post-watch
-        action = ui.post_watch_menu(ep_num, has_next=has_next, has_prev=has_prev)
-
-        if action == "next":
-            if has_next:
-                current_idx += 1
-            else:
-                sys.stdout.write(f"{Colors.BRIGHT_YELLOW}{Icons.WARNING} Sei all'ultimo episodio della serie!{Colors.RESET}\n")
-                break
-        elif action == "prev":
-            if has_prev:
-                current_idx -= 1
-            else:
-                sys.stdout.write(f"{Colors.BRIGHT_YELLOW}{Icons.WARNING} Sei al primo episodio della serie!{Colors.RESET}\n")
-        elif action == "replay":
-            continue
-        elif action == "select":
-            new_ep = ui.select_episode(title, episodes, aid)
-            if new_ep:
-                current_idx = episodes.index(new_ep)
-            else:
-                break
-        elif action == "download":
-            downloader.download_episode(
-                title,
-                ep_num,
-                ep_link,
-                episode_id=ep_id,
-            )
-            dl_action = ui.post_download_menu(ep_num, has_next=has_next, has_prev=has_prev)
-            if dl_action == "play":
-                target_file = downloader.download_base / sanitize_filename(title) / f"Episodio_{ep_num}.mp4"
-                local_stream_data = {
-                    "stream_url": str(target_file) if target_file.exists() else stream_data["stream_url"],
-                    "headers": stream_data.get("headers", {}),
-                    "format": "mp4",
-                    "subtitles": stream_data.get("subtitles", []),
-                }
-                player.play(
-                    stream_data=local_stream_data,
-                    anime_title=title,
-                    episode_number=ep_num,
-                )
-                continue
-            elif dl_action == "next":
-                if has_next:
-                    current_idx += 1
-                    next_ep = episodes[current_idx]
-                    downloader.download_episode(
-                        title,
-                        next_ep["number"],
-                        next_ep["link"],
-                        episode_id=next_ep.get("id"),
-                    )
-                else:
-                    sys.stdout.write(f"{Colors.BRIGHT_YELLOW}{Icons.WARNING} Sei all'ultimo episodio della serie!{Colors.RESET}\n")
-                continue
-            elif dl_action == "select":
-                new_ep = ui.select_episode(title, episodes, aid)
-                if new_ep:
-                    current_idx = episodes.index(new_ep)
-                else:
-                    break
-            elif dl_action == "quit":
-                break
-        elif action == "quit":
-            break
+    play_episodes(
+        config=config,
+        ui=ui,
+        history=history,
+        resolver=resolver,
+        player=player,
+        downloader=downloader,
+        title=title,
+        anime_id=aid,
+        slug=slug,
+        episodes=episodes,
+        start_idx=start_idx,
+    )
 
 
 if __name__ == "__main__":

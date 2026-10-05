@@ -1,6 +1,6 @@
 # Maintainer: ani-it contributors <info@ani-it.org>
 pkgname=ani-it
-pkgver=1.0.0
+pkgver=1.0.0   # deve coincidere con ani_it/_version.py (verificato da tests/test_packaging.py)
 pkgrel=1
 pkgdesc="CLI interattiva in stile ani-cli per lo streaming di anime da AnimeUnity in italiano"
 arch=('any')
@@ -19,21 +19,29 @@ optdepends=(
     'chafa: per visualizzare le anteprime delle locandine nella TUI'
 )
 makedepends=(
+    'git'
     'python-build'
     'python-installer'
     'python-wheel'
     'python-setuptools'
 )
-source=()
-sha256sums=()
+# Sorgente riproducibile: il tag di rilascio v$pkgver (git tag v1.0.0 && git push --tags).
+# Le sorgenti git non hanno checksum (SKIP): l'integrità è garantita dal tag.
+source=("$pkgname::git+$url.git#tag=v$pkgver")
+sha256sums=('SKIP')
 
 build() {
-    cd "$startdir"
+    cd "$srcdir/$pkgname"
     python -m build --wheel --no-isolation
 }
 
+check() {
+    cd "$srcdir/$pkgname"
+    python -m unittest discover -s tests
+}
+
 package() {
-    cd "$startdir"
+    cd "$srcdir/$pkgname"
     python -m installer --destdir="$pkgdir" dist/*.whl
 
     # Installazione delle shell completions

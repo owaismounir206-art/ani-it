@@ -1,22 +1,96 @@
 """Interfaccia utente TUI interattiva basata su fzf, chafa e grafica terminale moderna."""
 
 import json
-import os
-import shutil
+import re
+import shlex
 import subprocess
 import sys
-import textwrap
-from pathlib import Path
+import unicodedata
 from typing import Any, Optional
 
 from ani_it.config import Config
 from ani_it.constants import APP_NAME, APP_VERSION, Colors, Icons
 from ani_it.history import HistoryManager
+from ani_it.preview import is_valid_anime_id, render_preview
 from ani_it.utils import (
-    check_binary,
+    check_optional_dependencies,
     check_required_dependencies,
     get_cache_dir,
 )
+
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+# Larghezza interna dei box dei menu (in colonne visibili)
+MENU_BOX_WIDTH = 65
+
+# Pacchetti Arch per i binari noti (per gli altri si rimanda alla configurazione)
+KNOWN_PACMAN_PACKAGES = frozenset({"fzf", "mpv", "yt-dlp"})
+
+# Colonna del titolo nel menu di selezione anime (colonne visibili)
+TITLE_COLUMN_WIDTH = 65
+EPISODE_TITLE_WIDTH = 38
+
+
+def _single_line(value: Any) -> str:
+    """Testo su una sola riga: tab e a capo dell'API romperebbero le colonne separate da tab di fzf."""
+    return re.sub(r"[\t\r\n]+", " ", str(value or "")).strip()
+
+
+def char_width(char: str) -> int:
+    """Colonne occupate da un carattere: 0 per i combinanti, 2 per CJK/emoji larghi, altrimenti 1."""
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def display_width(text: str) -> int:
+    """Larghezza in colonne del testo (senza interpretare i codici ANSI)."""
+    return sum(char_width(c) for c in text)
+
+
+def visible_len(text: str) -> int:
+    """Colonne occupate dal testo senza i codici di colore ANSI."""
+    return display_width(ANSI_ESCAPE_RE.sub("", text))
+
+
+def pad_visible(text: str, width: int) -> str:
+    """Allinea a `width` colonne visibili: i codici ANSI non contano nella larghezza."""
+    return text + " " * max(0, width - visible_len(text))
+
+
+def fit_plain(text: str, width: int) -> str:
+    """Tronca (con '…') e riempie testo semplice a esattamente `width` colonne."""
+    if display_width(text) <= width:
+        return text + " " * (width - display_width(text))
+    out, used = [], 0
+    for char in text:
+        w = char_width(char)
+        if used + w > width - 1:
+            break
+        out.append(char)
+        used += w
+    return "".join(out) + "…" + " " * (width - used - 1)
+
+
+def fit_segments(segments: list[tuple[str, str]], width: int) -> str:
+    """Compone segmenti (colore, testo) in esattamente `width` colonne visibili.
+
+    Il troncamento e il riempimento si calcolano sul testo semplice e i colori si applicano
+    dopo, così nessuna sequenza ANSI viene tagliata a metà e le colonne restano allineate.
+    """
+    out: list[str] = []
+    used = 0
+    for color, text in segments:
+        room = width - used
+        if room <= 0:
+            break
+        if display_width(text) > room:
+            text = fit_plain(text, room).rstrip(" ") if room > 1 else "…"
+        out.append(f"{color}{text}{Colors.RESET}" if color else text)
+        used += display_width(text)
+    out.append(" " * max(0, width - used))
+    return "".join(out)
 
 
 class FzfUI:
@@ -38,6 +112,16 @@ class FzfUI:
         sys.stdout.flush()
 
     @staticmethod
+    def wait_for_enter(message: str = "Premi Invio per continuare...") -> None:
+        """Mette in pausa il flusso finché l'utente non preme Invio (per leggere un errore)."""
+        sys.stdout.write(f"\n  {Colors.DIM}{message}{Colors.RESET} ")
+        sys.stdout.flush()
+        try:
+            input()
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+    @staticmethod
     def print_banner() -> None:
         """Stampa un banner ASCII/Nerd Font accattivante con colori vivaci."""
         banner = f"""
@@ -50,17 +134,35 @@ class FzfUI:
         sys.stdout.flush()
 
     def verify_system_requirements(self) -> None:
-        """Verifica la presenza dei binari essenziali per Arch Linux prima dell'avvio."""
-        ok, missing = check_required_dependencies()
+        """Verifica i binari essenziali (fzf e il player configurato) e segnala yt-dlp se manca."""
+        ok, missing = check_required_dependencies(self.config.player.binary)
         if not ok:
-            missing_str = " ".join(missing)
-            sys.stderr.write(
-                f"\n{Colors.BRIGHT_RED}{Icons.ERROR} ERRORE DIPENDENZE ARCH LINUX:{Colors.RESET}\n"
-                f"I seguenti componenti obbligatori non sono installati nel sistema: {Colors.BOLD}{missing_str}{Colors.RESET}\n\n"
-                f"Puoi installarli su Arch Linux con il comando:\n"
-                f"  {Colors.BRIGHT_GREEN}sudo pacman -S {missing_str}{Colors.RESET}\n\n"
+            known = [m for m in missing if m in KNOWN_PACMAN_PACKAGES]
+            custom = [m for m in missing if m not in KNOWN_PACMAN_PACKAGES]
+            message = (
+                f"\n{Colors.BRIGHT_RED}{Icons.ERROR} ERRORE DIPENDENZE:{Colors.RESET}\n"
+                f"I seguenti componenti obbligatori non sono installati nel sistema: "
+                f"{Colors.BOLD}{' '.join(missing)}{Colors.RESET}\n\n"
             )
+            if known:
+                message += (
+                    f"Puoi installarli su Arch Linux con il comando:\n"
+                    f"  {Colors.BRIGHT_GREEN}sudo pacman -S {' '.join(known)}{Colors.RESET}\n\n"
+                )
+            if custom:
+                message += (
+                    f"Installa {' '.join(repr(c) for c in custom)} oppure correggi "
+                    f"{Colors.BOLD}player.binary{Colors.RESET} in config.toml.\n\n"
+                )
+            sys.stderr.write(message)
             sys.exit(1)
+
+        # yt-dlp serve solo per i download: lo streaming funziona anche senza
+        for dep in check_optional_dependencies():
+            sys.stderr.write(
+                f"{Colors.BRIGHT_YELLOW}{Icons.WARNING} {dep} non trovato: i download non saranno disponibili "
+                f"(sudo pacman -S {dep}).{Colors.RESET}\n"
+            )
 
     def select_anime(self, anime_list: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
         """Apre un menu interattivo fzf con preview grafica chafa e palette colori curata."""
@@ -73,6 +175,8 @@ class FzfUI:
         # Salva i dettagli di ogni anime nella cache per la preview dinamica di fzf
         for item in anime_list:
             aid = str(item["id"])
+            if not is_valid_anime_id(aid):
+                continue  # l'ID diventa un nome di file: solo numerici
             cache_file = self.data_cache_dir / f"{aid}.json"
             try:
                 with open(cache_file, "w", encoding="utf-8") as f:
@@ -93,32 +197,43 @@ class FzfUI:
             else:
                 type_badge = f"{Colors.BRIGHT_CYAN}󰎁 [{raw_type[:5]}]{Colors.RESET}"
 
-            title = str(item.get("title") or "").strip()
+            title = _single_line(item.get("title"))
             if not title or title.lower() in ("senza titolo", "anime senza titolo", "null", "none"):
-                title = str(item.get("title_eng") or item.get("slug") or f"Anime {item.get('id')}").replace("-", " ").title()
+                title = _single_line(
+                    item.get("title_eng") or item.get("slug") or f"Anime {item.get('id')}"
+                ).replace("-", " ").title()
 
-            is_ita = "(ita)" in title.lower() or "-ita" in str(item.get("slug", "")).lower()
-            lang_tag = f"{Colors.BRIGHT_GREEN}[ITA]{Colors.RESET} " if is_ita else f"{Colors.DIM}[SUB]{Colors.RESET} "
-
-            eng = item.get("title_eng")
-            if eng and eng.lower() != title.lower() and not is_ita:
-                display_title = f"{lang_tag}{title} {Colors.DIM}({eng[:30]}){Colors.RESET}"
+            # Doppiaggio dal campo `dub` dell'API; solo per le voci senza il campo (cronologia)
+            # si ripiega sul suffisso "-ita" dello slug (mai su una sottostringa).
+            if "dub" in item:
+                is_ita = bool(item["dub"])
             else:
-                display_title = f"{lang_tag}{title}"
-            display_title = display_title[:75]
+                is_ita = str(item.get("slug", "")).lower().endswith("-ita")
 
-            year = str(item.get("year", "N/D"))
-            eps_val = str(item.get("episodes_count", "?"))
+            # Segmenti (colore, testo semplice): troncamento e padding sul testo visibile,
+            # colori applicati dopo (niente sequenze ANSI tagliate né colonne sfalsate)
+            segments = [
+                (Colors.BRIGHT_GREEN, "[ITA]") if is_ita else (Colors.DIM, "[SUB]"),
+                ("", " "),
+                ("", title),
+            ]
+            eng = _single_line(item.get("title_eng"))
+            if eng and eng.lower() != title.lower() and not is_ita:
+                segments += [("", " "), (Colors.DIM, f"({eng[:30]})")]
+            display_title = fit_segments(segments, TITLE_COLUMN_WIDTH)
+
+            year = _single_line(item.get("year", "N/D"))
+            eps_val = _single_line(item.get("episodes_count", "?"))
             eps = f"{eps_val} ep."
 
             aid = str(item["id"])
-            line = f"{type_badge}\t{display_title:<65}\t{year:<6}\t{eps:<8}\t{aid}"
+            line = f"{type_badge}\t{display_title}\t{year:<6}\t{eps:<8}\t{aid}"
             fzf_lines.append(line)
 
         input_data = "\n".join(fzf_lines)
 
-        py_bin = sys.executable
-        preview_cmd = f"{py_bin} -m ani_it --preview-anime {{5}}"
+        # Ogni preview è un nuovo processo: modulo leggero e percorso di Python tra virgolette
+        preview_cmd = f"{shlex.quote(sys.executable)} -m ani_it.preview {{5}}"
 
         # Palette stile Tokyo Night / Catppuccin per fzf
         fzf_args = [
@@ -129,7 +244,7 @@ class FzfUI:
             "--border=rounded",
             "--delimiter=\t",
             "--with-nth=1..4",
-            f"--prompt= 󰍉 Cerca Anime > ",
+            "--prompt= 󰍉 Cerca Anime > ",
             "--pointer=󰐊",
             "--marker=󰄬",
             "--header=TIPO      TITOLO                                                           ANNO   EPISODI",
@@ -142,11 +257,12 @@ class FzfUI:
         ]
 
         try:
+            # Si cattura solo stdout: fzf disegna l'interfaccia su stderr in alcune versioni
             res = subprocess.run(
                 fzf_args,
                 input=input_data,
                 text=True,
-                capture_output=True,
+                stdout=subprocess.PIPE,
                 check=False,
             )
             if res.returncode != 0 or not res.stdout.strip():
@@ -178,6 +294,7 @@ class FzfUI:
 
         hist_entry = self.history.get_anime_history(anime_id)
         last_watched_ep = hist_entry.get("last_episode", 0) if hist_entry else 0
+        last_ep_completed = bool(hist_entry.get("episode_completed")) if hist_entry else False
 
         fzf_lines: list[str] = []
         for ep in episodes:
@@ -188,7 +305,7 @@ class FzfUI:
                 num_val = 0.0
 
             if last_watched_ep > 0:
-                if num_val < last_watched_ep:
+                if num_val < last_watched_ep or (num_val == last_watched_ep and last_ep_completed):
                     badge = f"{Colors.BRIGHT_GREEN}󰄬 [VISTO]{Colors.RESET}    "
                 elif num_val == last_watched_ep:
                     badge = f"{Colors.BRIGHT_YELLOW}󰐊 [IN CORSO]{Colors.RESET} "
@@ -218,7 +335,10 @@ class FzfUI:
 
             created = ep.get("created_at", "")
 
-            line = f"{badge}  EP. {num_str:<4} │ {clean_title:<38}\t{created}\t{ep.get('id')}"
+            line = (
+                f"{badge}  EP. {num_str:<4} │ {fit_plain(_single_line(clean_title), EPISODE_TITLE_WIDTH)}"
+                f"\t{created}\t{ep.get('id')}"
+            )
             fzf_lines.append(line)
 
         input_data = "\n".join(fzf_lines)
@@ -231,7 +351,7 @@ class FzfUI:
             "--border=rounded",
             "--delimiter=\t",
             "--with-nth=1..2",
-            f"--prompt= 󰐊 Seleziona Episodio > ",
+            "--prompt= 󰐊 Seleziona Episodio > ",
             "--pointer=󰐊",
             "--marker=󰄬",
             f"--header=Serie: {anime_title} (Totale: {len(episodes)} ep.)\nSTATO        EPISODIO   TITOLO                                  DATA RILASCIO",
@@ -246,7 +366,7 @@ class FzfUI:
                 fzf_args,
                 input=input_data,
                 text=True,
-                capture_output=True,
+                stdout=subprocess.PIPE,
                 check=False,
             )
             if res.returncode != 0 or not res.stdout.strip():
@@ -265,44 +385,99 @@ class FzfUI:
 
         return None
 
+    @staticmethod
+    def _render_box(title: str, rows: list[str], border: str) -> str:
+        """Box con bordi allineati: la larghezza si calcola sul testo visibile (senza ANSI)."""
+        inner = MENU_BOX_WIDTH
+        top_fill = "─" * max(1, inner - visible_len(title) - 5)
+        lines = [
+            f"{border}  ╭─── {Colors.BOLD}{Colors.BRIGHT_CYAN}{title}{Colors.RESET}{border} {top_fill}╮",
+            f"  │{' ' * inner}│",
+        ]
+        lines += [f"  │{pad_visible('   ' + row, inner)}│" for row in rows]
+        lines += [f"  │{' ' * inner}│", f"  ╰{'─' * inner}╯{Colors.RESET}"]
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _prompt_choice(valid: dict[str, str], default: Optional[str], prompt: str) -> str:
+        """Chiede una scelta finché non è valida. Invio = default; EOF/Ctrl+C = 'quit'.
+
+        `valid` associa ogni input accettato (minuscolo) all'azione restituita: le voci non
+        disponibili non vi compaiono, così una scelta non offerta viene richiesta di nuovo
+        invece di essere interpretata come un'altra azione.
+        """
+        while True:
+            sys.stdout.write(f"  {Colors.BOLD}{Colors.BRIGHT_CYAN}{Icons.ARROW_RIGHT} {prompt}{Colors.RESET}")
+            sys.stdout.flush()
+            try:
+                choice = input().strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return "quit"
+            if not choice and default is not None:
+                return default
+            if choice in valid:
+                return valid[choice]
+            sys.stdout.write(f"  {Colors.BRIGHT_YELLOW}{Icons.WARNING} Scelta non valida.{Colors.RESET}\n")
+
     def post_watch_menu(self, current_episode_num: Any, has_next: bool, has_prev: bool) -> str:
-        """Mostra il menu istantaneo post-visione nel terminale racchiuso in un box ordinato."""
+        """Menu post-visione: mostra e accetta solo le azioni disponibili per questo episodio."""
         self.clear_screen()
-        menu_box = f"""
-{Colors.BRIGHT_BLUE}  ╭─── {Colors.BOLD}{Colors.BRIGHT_CYAN}{Icons.TV} Riproduzione terminata: Episodio {current_episode_num}{Colors.RESET}{Colors.BRIGHT_BLUE} ────────────────────────╮
-  │                                                                 │
-  │   {Colors.BRIGHT_GREEN}󰐊 [Invio] / [n]{Colors.RESET}  Riproduci prossimo episodio                     │
-  │   {Colors.BRIGHT_YELLOW}󰁍 [p]{Colors.RESET}            Riproduci episodio precedente                   │
-  │   {Colors.BRIGHT_CYAN}󰑐 [r]{Colors.RESET}            Riavvia questo episodio                         │
-  │   {Colors.WHITE}󰍉 [s]{Colors.RESET}            Torna alla selezione episodi                    │
-  │   {Colors.BRIGHT_MAGENTA}󰇚 [d]{Colors.RESET}            Scarica questo episodio                         │
-  │   {Colors.BRIGHT_RED}󰅚 [q]{Colors.RESET}            Esci dal programma                              │
-  │                                                                 │
-  ╰─────────────────────────────────────────────────────────────────╯{Colors.RESET}
-"""
-        sys.stdout.write(menu_box)
-        sys.stdout.write(f"  {Colors.BOLD}{Colors.BRIGHT_CYAN}{Icons.ARROW_RIGHT} Azione [n]: {Colors.RESET}")
-        sys.stdout.flush()
+        valid = {"r": "replay", "replay": "replay", "restart": "replay",
+                 "s": "select", "select": "select", "scegli": "select",
+                 "d": "download", "download": "download", "scarica": "download",
+                 "q": "quit", "quit": "quit", "esci": "quit"}
+        rows: list[str] = []
+        if has_next:
+            valid.update({"n": "next", "next": "next", "prossimo": "next"})
+            rows.append(f"{Colors.BRIGHT_GREEN}󰐊 [Invio] / [n]{Colors.RESET}  Riproduci prossimo episodio")
+        if has_prev:
+            valid.update({"p": "prev", "prev": "prev", "precedente": "prev"})
+            rows.append(f"{Colors.BRIGHT_YELLOW}󰁍 [p]{Colors.RESET}            Riproduci episodio precedente")
+        rows += [
+            f"{Colors.BRIGHT_CYAN}󰑐 [r]{Colors.RESET}            Riavvia questo episodio",
+            f"{Colors.WHITE}󰍉 [s]{Colors.RESET}            Torna alla selezione episodi",
+            f"{Colors.BRIGHT_MAGENTA}󰇚 [d]{Colors.RESET}            Scarica questo episodio",
+            f"{Colors.BRIGHT_RED}󰅚 [q]{Colors.RESET}            Esci dal programma",
+        ]
+        sys.stdout.write("\n" + self._render_box(
+            f"{Icons.TV} Riproduzione terminata: Episodio {current_episode_num}", rows, Colors.BRIGHT_BLUE
+        ))
+        default = "next" if has_next else "select"
+        return self._prompt_choice(valid, default, f"Azione [{'n' if has_next else 's'}]: ")
 
-        try:
-            choice = input().strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return "quit"
+    def error_menu(
+        self,
+        current_episode_num: Any,
+        message: str,
+        has_next: bool,
+        has_prev: bool,
+    ) -> str:
+        """Menu mostrato dopo un errore (risoluzione stream, riproduzione, download).
 
-        if not choice or choice in ("n", "next", "prossimo"):
-            return "next"
-        if choice in ("p", "prev", "precedente"):
-            return "prev"
-        if choice in ("r", "replay", "restart"):
-            return "replay"
-        if choice in ("s", "select", "scegli"):
-            return "select"
-        if choice in ("d", "download", "scarica"):
-            return "download"
-        if choice in ("q", "quit", "esci"):
-            return "quit"
-
-        return "next"
+        Non pulisce lo schermo, così il messaggio resta leggibile. Restituisce
+        'retry', 'next', 'prev', 'select', 'download' o 'quit'.
+        """
+        sys.stdout.write(f"\n  {Colors.BRIGHT_RED}{Icons.ERROR} {message}{Colors.RESET}\n")
+        valid = {"r": "retry", "retry": "retry", "riprova": "retry",
+                 "s": "select", "select": "select", "scegli": "select",
+                 "d": "download", "download": "download", "scarica": "download",
+                 "q": "quit", "quit": "quit", "esci": "quit"}
+        rows = [f"{Colors.BRIGHT_GREEN}󰑐 [Invio] / [r]{Colors.RESET}  Riprova questo episodio"]
+        if has_next:
+            valid.update({"n": "next", "next": "next", "prossimo": "next"})
+            rows.append(f"{Colors.BRIGHT_CYAN}󰐊 [n]{Colors.RESET}            Passa al prossimo episodio")
+        if has_prev:
+            valid.update({"p": "prev", "prev": "prev", "precedente": "prev"})
+            rows.append(f"{Colors.BRIGHT_YELLOW}󰁍 [p]{Colors.RESET}            Passa all'episodio precedente")
+        rows += [
+            f"{Colors.WHITE}󰍉 [s]{Colors.RESET}            Torna alla selezione episodi",
+            f"{Colors.BRIGHT_MAGENTA}󰇚 [d]{Colors.RESET}            Prova a scaricare l'episodio",
+            f"{Colors.BRIGHT_RED}󰅚 [q]{Colors.RESET}            Esci dal programma",
+        ]
+        sys.stdout.write("\n" + self._render_box(
+            f"{Icons.ERROR} Errore: Episodio {current_episode_num}", rows, Colors.BRIGHT_RED
+        ))
+        return self._prompt_choice(valid, "retry", "Azione [r]: ")
 
     def post_download_menu(
         self,
@@ -310,101 +485,24 @@ class FzfUI:
         has_next: bool = True,
         has_prev: bool = False,
     ) -> str:
-        """Mostra il menu dedicato post-download per evitare riproduzioni accidentali o sovrapposizioni."""
+        """Menu dedicato post-download (mostrato solo se il download è riuscito)."""
         self.clear_screen()
-        menu_box = f"""
-{Colors.BRIGHT_MAGENTA}  ╭─── {Colors.BOLD}{Colors.BRIGHT_CYAN}{Icons.DOWNLOAD} Download completato: Episodio {current_episode_num}{Colors.RESET}{Colors.BRIGHT_MAGENTA} ────────────────────────╮
-  │                                                                 │
-  │   {Colors.BRIGHT_GREEN}󰐊 [Invio] / [p]{Colors.RESET}  Riproduci episodio scaricato con MPV            │
-  │   {Colors.BRIGHT_CYAN}󰑐 [n]{Colors.RESET}            Scarica prossimo episodio                       │
-  │   {Colors.WHITE}󰍉 [s]{Colors.RESET}            Torna alla selezione episodi                    │
-  │   {Colors.BRIGHT_RED}󰅚 [q]{Colors.RESET}            Esci dal programma                              │
-  │                                                                 │
-  ╰─────────────────────────────────────────────────────────────────╯{Colors.RESET}
-"""
-        sys.stdout.write(menu_box)
-        sys.stdout.write(f"  {Colors.BOLD}{Colors.BRIGHT_CYAN}{Icons.ARROW_RIGHT} Azione [p]: {Colors.RESET}")
-        sys.stdout.flush()
-
-        try:
-            choice = input().strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return "quit"
-
-        if not choice or choice in ("p", "play", "riproduci"):
-            return "play"
-        if choice in ("n", "next", "prossimo"):
-            return "next"
-        if choice in ("s", "select", "scegli"):
-            return "select"
-        if choice in ("q", "quit", "esci"):
-            return "quit"
-
-        return "play"
+        valid = {"p": "play", "play": "play", "riproduci": "play",
+                 "s": "select", "select": "select", "scegli": "select",
+                 "q": "quit", "quit": "quit", "esci": "quit"}
+        rows = [f"{Colors.BRIGHT_GREEN}󰐊 [Invio] / [p]{Colors.RESET}  Riproduci episodio scaricato con MPV"]
+        if has_next:
+            valid.update({"n": "next", "next": "next", "prossimo": "next"})
+            rows.append(f"{Colors.BRIGHT_CYAN}󰑐 [n]{Colors.RESET}            Scarica prossimo episodio")
+        rows += [
+            f"{Colors.WHITE}󰍉 [s]{Colors.RESET}            Torna alla selezione episodi",
+            f"{Colors.BRIGHT_RED}󰅚 [q]{Colors.RESET}            Esci dal programma",
+        ]
+        sys.stdout.write("\n" + self._render_box(
+            f"{Icons.DOWNLOAD} Download completato: Episodio {current_episode_num}", rows, Colors.BRIGHT_MAGENTA
+        ))
+        return self._prompt_choice(valid, "play", "Azione [p]: ")
 
     def render_anime_preview(self, anime_id: str) -> None:
-        """Stampa la preview formattata con chafa (locandina grafica) e sinossi per fzf."""
-        cache_file = self.data_cache_dir / f"{anime_id}.json"
-        if not cache_file.is_file():
-            sys.stdout.write(f"{Colors.DIM}Nessuna informazione disponibile per l'anime {anime_id}{Colors.RESET}\n")
-            return
-
-        try:
-            with open(cache_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            return
-
-        title = data.get("title", "")
-        title_eng = data.get("title_eng", "")
-        year = data.get("year", "N/D")
-        anime_type = data.get("type", "TV")
-        status = data.get("status", "Terminato")
-        eps = data.get("episodes_count", "?")
-        plot = data.get("plot", "Nessuna trama fornita.")
-        img_url = data.get("image_url", "")
-        genres = data.get("genres", [])
-        score = data.get("score", "")
-
-        # Rendering locandina con chafa se disponibile e abilitato
-        if self.config.general.preview_art and check_binary("chafa") and img_url:
-            cover_path = self.covers_dir / f"{anime_id}.jpg"
-            if not cover_path.exists():
-                try:
-                    import requests
-                    r = requests.get(img_url, timeout=5)
-                    if r.status_code == 200:
-                        cover_path.write_bytes(r.content)
-                except Exception:
-                    pass
-
-            if cover_path.exists():
-                try:
-                    subprocess.run(
-                        ["chafa", "--size=36x20", "--clear", "--symbols=vhalf,braille", str(cover_path)],
-                        check=False,
-                    )
-                except Exception:
-                    pass
-
-        # Scheda descrittiva elegante
-        sys.stdout.write(f"\n{Colors.BOLD}{Colors.BRIGHT_WHITE}╭───────────────────────────────────────────────────╮{Colors.RESET}\n")
-        sys.stdout.write(f"{Colors.BOLD}{Colors.BRIGHT_CYAN}  {title[:47]}{Colors.RESET}\n")
-        if title_eng and title_eng.lower() != title.lower():
-            sys.stdout.write(f"{Colors.DIM}  {title_eng[:47]}{Colors.RESET}\n")
-        sys.stdout.write(f"{Colors.BOLD}{Colors.BRIGHT_WHITE}╰───────────────────────────────────────────────────╯{Colors.RESET}\n")
-
-        # Metadati a icone
-        score_str = f"  {Colors.BRIGHT_YELLOW}⭐ Voto:{Colors.RESET} {score}" if score else ""
-        sys.stdout.write(f"{Colors.BRIGHT_CYAN}󰎁 Tipo:{Colors.RESET} {anime_type}   {Colors.BRIGHT_GREEN}󰃭 Anno:{Colors.RESET} {year}   {Colors.BRIGHT_MAGENTA}󰐊 Episodi:{Colors.RESET} {eps}{score_str}\n")
-        sys.stdout.write(f"{Colors.BRIGHT_BLUE}󰅚 Stato:{Colors.RESET} {status}\n")
-
-        if genres:
-            genre_line = ", ".join(genres[:4])
-            sys.stdout.write(f"{Colors.BRIGHT_YELLOW}🎭 Generi:{Colors.RESET} {genre_line}\n")
-
-        # Trama formattata con a capo automatico
-        if plot:
-            sys.stdout.write(f"\n{Colors.BOLD}{Colors.BRIGHT_WHITE}󰋽 TRAMA:{Colors.RESET}\n")
-            wrapped = textwrap.fill(plot, width=54)
-            sys.stdout.write(f"{Colors.WHITE}{wrapped}{Colors.RESET}\n")
+        """Stampa la scheda dell'anime (locandina con chafa + sinossi) letta dalla cache."""
+        render_preview(anime_id, self.config.general.preview_art, cache_dir=self.cache_dir)

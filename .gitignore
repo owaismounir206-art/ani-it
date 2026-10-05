@@ -30,3 +30,6 @@ ENV/
 *.part
 *.aria2
 test.txt
+
+# Strumenti di sviluppo
+.ruff_cache/

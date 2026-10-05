@@ -5,6 +5,7 @@ pkgbase = ani-it
 	url = https://github.com/owaismounir206-art/ani-it
 	arch = any
 	license = GPL-3.0-or-later
+	makedepends = git
 	makedepends = python-build
 	makedepends = python-installer
 	makedepends = python-wheel
@@ -17,5 +18,7 @@ pkgbase = ani-it
 	depends = yt-dlp
 	optdepends = aria2: per accelerare i download con connessioni multiple segmentate
 	optdepends = chafa: per visualizzare le anteprime delle locandine nella TUI
+	source = ani-it::git+https://github.com/owaismounir206-art/ani-it.git#tag=v1.0.0
+	sha256sums = SKIP
 
 pkgname = ani-it

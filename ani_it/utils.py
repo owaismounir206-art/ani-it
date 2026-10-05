@@ -1,13 +1,16 @@
 """Funzioni di utilità per ani-it: conformità XDG, deoffuscamento JS, rilevamento display e gestione segnali."""
 
+import math
 import os
 import re
 import sys
 import shutil
 import signal
+import stat
 import subprocess
+import tempfile
 from pathlib import Path
-from typing import Callable, Any, Optional
+from typing import Callable, Any, Iterable, Optional
 
 from ani_it.constants import APP_NAME, Colors
 
@@ -39,16 +42,42 @@ def get_cache_dir() -> Path:
     return path
 
 
+# Base del percorso di ripiego quando XDG_RUNTIME_DIR non è definita
+FALLBACK_RUNTIME_BASE = Path("/tmp")
+
+
+def _private_dir(path: Path) -> Path:
+    """Crea `path` con permessi 0700 e verifica che sia una directory dell'utente corrente.
+
+    Solleva OSError se `path` è un symlink, non è una directory o appartiene a un altro
+    utente (un percorso prevedibile in /tmp può essere stato predisposto da qualcun altro).
+    Una directory propria con permessi troppo larghi viene ristretta a 0700.
+    """
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()  # lstat: non segue i symlink
+    if not stat.S_ISDIR(info.st_mode):
+        raise PermissionError(f"{path} non è una directory (o è un symlink)")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise PermissionError(f"{path} appartiene a un altro utente")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        path.chmod(0o700)
+    return path
+
+
 def get_runtime_dir() -> Path:
-    """Restituisce il percorso per socket e runtime IPC conforme a XDG."""
+    """Restituisce una directory privata (0700) per socket e runtime IPC, conforme a XDG."""
     xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
     if xdg_runtime:
-        path = Path(xdg_runtime) / APP_NAME
+        candidate = Path(xdg_runtime) / APP_NAME
     else:
         uid = os.getuid() if hasattr(os, "getuid") else 1000
-        path = Path(f"/tmp/ani-it-{uid}")
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+        candidate = FALLBACK_RUNTIME_BASE / f"ani-it-{uid}"
+
+    try:
+        return _private_dir(candidate)
+    except OSError:
+        # Percorso non utilizzabile in modo sicuro: directory temporanea nuova (0700)
+        return Path(tempfile.mkdtemp(prefix=f"{APP_NAME}-"))
 
 
 def get_download_dir() -> Path:
@@ -73,9 +102,8 @@ def get_download_dir() -> Path:
     except Exception:
         pass
 
-    fallback = Path.home() / "Downloads" / "Anime"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+    # Nessuna creazione qui: la cartella viene creata al momento del download
+    return Path.home() / "Downloads" / "Anime"
 
 
 def detect_display_server() -> str:
@@ -97,20 +125,36 @@ def check_binary(binary_name: str) -> bool:
     return shutil.which(binary_name) is not None
 
 
-def check_required_dependencies() -> tuple[bool, list[str]]:
-    """Controlla la presenza delle dipendenze di sistema minime (fzf, mpv)."""
+def check_required_dependencies(player_binary: str = "mpv") -> tuple[bool, list[str]]:
+    """Controlla i binari senza i quali il programma non può funzionare: fzf e il player configurato."""
     missing: list[str] = []
-    for dep in ("fzf", "mpv"):
+    for dep in ("fzf", player_binary):
         if not check_binary(dep):
             missing.append(dep)
     return len(missing) == 0, missing
 
 
+def check_optional_dependencies() -> list[str]:
+    """Binari che servono solo per i download (yt-dlp): la loro assenza non blocca lo streaming."""
+    return [dep for dep in ("yt-dlp",) if not check_binary(dep)]
+
+
+# Lunghezza massima in byte del nome di una cartella/file (il limite dei filesystem Linux è 255)
+MAX_FILENAME_BYTES = 200
+
+
 def sanitize_filename(name: str) -> str:
-    """Rimuove caratteri non validi nei filesystem POSIX/Linux."""
-    # Rimuovi slash, caratteri di controllo e simboli rischiosi
+    """Rende sicuro per il filesystem un titolo che arriva dall'API del sito.
+
+    Sostituisce i caratteri non validi e i caratteri di controllo, elimina punti e spazi
+    ai bordi (così `..` non può risalire di cartella e il nome non diventa un file nascosto)
+    e limita la lunghezza in byte.
+    """
     cleaned = re.sub(r'[/\\?%*:|"<>]', "_", name)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    if len(cleaned.encode("utf-8")) > MAX_FILENAME_BYTES:
+        cleaned = cleaned.encode("utf-8")[:MAX_FILENAME_BYTES].decode("utf-8", errors="ignore").strip(" .")
     return cleaned or "anime"
 
 
@@ -125,37 +169,97 @@ def format_duration(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def parse_episode_range(range_str: str, max_ep: int) -> list[int]:
-    """Interpreta stringhe di range come '1-12', '1,3,5', 'all', o '5'."""
-    s = range_str.strip().lower()
-    if s in ("all", "*"):
-        return list(range(1, max_ep + 1))
+def quality_height(quality: str) -> Optional[int]:
+    """Altezza in pixel di una qualità come '720p' o '720'; None per 'best' o valori non validi."""
+    match = re.search(r"\d+", str(quality))
+    return int(match.group()) if match else None
 
-    episodes: set[int] = set()
-    parts = s.split(",")
-    for part in parts:
-        part = part.strip()
-        if not part:
+
+EpisodeNumber = int | float
+
+_EPISODE_NUMBER_RE = re.compile(r"^\d+(?:\.\d+)?$")
+
+
+def normalize_episode_number(value: Any) -> Optional[EpisodeNumber]:
+    """Restituisce il numero reale di un episodio: int se intero, float se decimale (12.5).
+
+    Restituisce None se il valore non è un numero valido (None, '', 'abc', '1.2.3', 'nan').
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text = str(value).strip()
+        if not _EPISODE_NUMBER_RE.match(text):
+            return None
+        number = float(text)
+    if not math.isfinite(number):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _parse_range_bound(text: str, token: str) -> EpisodeNumber:
+    number = normalize_episode_number(text.strip())
+    if number is None:
+        raise ValueError(f"Intervallo episodi non valido: {token!r}")
+    return number
+
+
+def parse_episode_range(
+    range_str: str,
+    available: Iterable[Any],
+) -> tuple[list[EpisodeNumber], list[EpisodeNumber]]:
+    """Interpreta '1-12', '1,3,5', '12.5', 'all' contro i numeri di episodio realmente presenti.
+
+    Args:
+        range_str: Intervallo richiesto dall'utente.
+        available: Numeri degli episodi esistenti (anche con buchi, decimali o partenza da 0).
+
+    Returns:
+        (selezionati, mancanti): gli episodi presenti da scaricare e i numeri richiesti
+        che non esistono. Per gli intervalli si segnalano solo i buchi interni alla
+        numerazione, non i numeri oltre l'ultimo episodio.
+
+    Raises:
+        ValueError: se un elemento dell'intervallo non è un numero valido.
+    """
+    numbers = sorted({n for n in map(normalize_episode_number, available) if n is not None})
+    spec = range_str.strip().lower()
+    if spec in ("all", "*"):
+        return numbers, []
+
+    present = set(numbers)
+    selected: set[EpisodeNumber] = set()
+    missing: set[EpisodeNumber] = set()
+
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
             continue
-        if "-" in part:
-            sub = part.split("-", 1)
-            try:
-                start = int(sub[0])
-                end = int(sub[1])
-                for ep in range(min(start, end), max(start, end) + 1):
-                    if 1 <= ep <= max_ep:
-                        episodes.add(ep)
-            except ValueError:
-                continue
-        else:
-            try:
-                ep = int(part)
-                if 1 <= ep <= max_ep:
-                    episodes.add(ep)
-            except ValueError:
-                continue
 
-    return sorted(list(episodes))
+        if "-" in token:
+            left, _, right = token.partition("-")
+            first_bound = _parse_range_bound(left, token)
+            second_bound = _parse_range_bound(right, token)
+            low, high = min(first_bound, second_bound), max(first_bound, second_bound)
+            selected.update(n for n in numbers if low <= n <= high)
+
+            if numbers:
+                candidate = math.ceil(max(low, numbers[0]))
+                last = min(high, numbers[-1])
+                while candidate <= last:
+                    if candidate not in present:
+                        missing.add(candidate)
+                    candidate += 1
+        else:
+            number = _parse_range_bound(token, token)
+            if number in present:
+                selected.add(number)
+            else:
+                missing.add(number)
+
+    return sorted(selected), sorted(missing)
 
 
 class SignalHandler:
@@ -178,8 +282,15 @@ class SignalHandler:
 
     @classmethod
     def register_cleanup(cls, callback: Callable[[], None]) -> None:
-        """Registra una funzione di pulizia (es. rimozione socket temporanei)."""
-        cls._cleanup_callbacks.append(callback)
+        """Registra una funzione di pulizia (es. rimozione socket temporanei). Senza duplicati."""
+        if callback not in cls._cleanup_callbacks:
+            cls._cleanup_callbacks.append(callback)
+
+    @classmethod
+    def unregister_cleanup(cls, callback: Callable[[], None]) -> None:
+        """Rimuove una funzione di pulizia registrata (non fa nulla se assente)."""
+        if callback in cls._cleanup_callbacks:
+            cls._cleanup_callbacks.remove(callback)
 
     @classmethod
     def install(cls) -> None:
@@ -261,7 +372,7 @@ def unpack_js(packed_code: str) -> str:
         if not match:
             return packed_code
 
-    payload_raw, radix_str, count_str, words_raw = match.groups()
+    payload_raw, radix_str, _count, words_raw = match.groups()
 
     # Pulisci payload
     payload = payload_raw[1:-1]  # Rimuovi apici esterni
@@ -270,7 +381,6 @@ def unpack_js(packed_code: str) -> str:
 
     try:
         radix = int(radix_str)
-        count = int(count_str)
     except ValueError:
         return packed_code
 

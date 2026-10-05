@@ -4,7 +4,6 @@ import html
 import json
 import logging
 import re
-import sys
 import time
 from typing import Any, Optional
 from urllib.parse import urljoin
@@ -12,41 +11,86 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-from ani_it.constants import (
-    ARCHIVE_ENDPOINT,
-    BASE_URL,
-    DEFAULT_HEADERS,
-    GET_ANIMES_ENDPOINT,
-    INFO_API_ENDPOINT,
-    INFO_ENDPOINT,
-    LIVESEARCH_ENDPOINT,
-    Colors,
-    Icons,
-)
+from ani_it.constants import DEFAULT_BASE_URL, DEFAULT_USER_AGENT, Endpoints, site_headers
+from ani_it.utils import normalize_episode_number
 
 logger = logging.getLogger("ani_it.scraper")
+
+
+class EpisodesNotFoundError(Exception):
+    """La scheda dell'anime è stata letta senza errori ma non contiene alcun episodio."""
+
+
+class SiteUnreachableError(requests.exceptions.ConnectionError):
+    """AnimeUnity non è raggiungibile (rete, timeout) o risponde con errori persistenti (403/429/5xx).
+
+    Estende ConnectionError per restare compatibile con chi già la intercetta.
+    """
+
+
+class ResourceNotFoundError(Exception):
+    """AnimeUnity è raggiungibile ma la risorsa richiesta non esiste (HTTP 404/410)."""
+
+
+# Stati HTTP transitori: ha senso ritentare. Gli altri 4xx (404, 422, ...) non cambiano ritentando.
+RETRYABLE_STATUS = frozenset({403, 429})
+
+
+def title_from_slug(slug: str) -> str:
+    """Titolo leggibile ricavato dallo slug, con il suffisso di lingua come tag (ITA / SUB ITA).
+
+    Il suffisso si riconosce sui token interi dello slug: '-ita' dentro un'altra parola
+    (es. 'hospitalita') non è un tag, e i tag restano in maiuscolo.
+    """
+    tokens = [t for t in slug.split("-") if t]
+    tag = ""
+    if len(tokens) > 2 and tokens[-2:] == ["sub", "ita"]:
+        tag, tokens = " (SUB ITA)", tokens[:-2]
+    elif len(tokens) > 1 and tokens[-1] == "ita":
+        tag, tokens = " (ITA)", tokens[:-1]
+    return " ".join(t.capitalize() for t in tokens) + tag
 
 
 class AnimeUnityScraper:
     """Gestisce le comunicazioni HTTP verso AnimeUnity, con gestione sessione, CSRF token, retry e parsing multi-livello."""
 
-    def __init__(self, session: Optional[requests.Session] = None) -> None:
+    def __init__(self, session: Optional[requests.Session] = None, base_url: str = DEFAULT_BASE_URL) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.endpoints = Endpoints(self.base_url)
         self.session = session or requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
+        # La sessione è condivisa col resolver (Vixcloud, CDN): gli header specifici di
+        # AnimeUnity (Origin, Sec-Fetch-*, CSRF, XHR) vanno solo nelle richieste al sito.
+        self.session.headers.setdefault("User-Agent", DEFAULT_USER_AGENT)
         self.max_retries = 3
         self.base_backoff = 1.0
         self._csrf_token: Optional[str] = None
         self._csrf_expires: float = 0.0
 
+    def _site_headers(self, api: bool = False, extra: Optional[dict[str, str]] = None) -> dict[str, str]:
+        """Header per le richieste ad AnimeUnity. Quelli AJAX/CSRF solo per le chiamate API."""
+        headers = site_headers(self.base_url)
+        if api:
+            headers.update({
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/plain, */*",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+            })
+            if self._csrf_token:
+                headers["X-CSRF-TOKEN"] = self._csrf_token
+        if extra:
+            headers.update(extra)
+        return headers
+
     def _ensure_session(self) -> None:
-        """Inizializza la sessione HTTP e recupera il token CSRF necessario per le chiamate API interne."""
+        """Recupera il token CSRF necessario per le chiamate API interne (senza toccare la sessione)."""
         if self._csrf_token and time.time() < self._csrf_expires:
             return
 
         try:
             resp = self.session.get(
-                BASE_URL,
-                headers=dict(self.session.headers),
+                self.base_url,
+                headers=self._site_headers(),
                 timeout=10,
                 allow_redirects=True,
             )
@@ -58,8 +102,6 @@ class AnimeUnityScraper:
             if match:
                 self._csrf_token = match.group(1).strip()
                 self._csrf_expires = time.time() + 300
-                self.session.headers["X-CSRF-TOKEN"] = self._csrf_token
-                self.session.headers["X-Requested-With"] = "XMLHttpRequest"
         except Exception as exc:
             logger.debug("Impossibile recuperare il token CSRF da AnimeUnity: %s", exc)
 
@@ -70,13 +112,21 @@ class AnimeUnityScraper:
         params: Optional[dict[str, Any]] = None,
         json_data: Optional[dict[str, Any]] = None,
         headers: Optional[dict[str, str]] = None,
+        api: bool = False,
     ) -> requests.Response:
-        """Invia una richiesta HTTP (GET o POST) con retry esponenziale e gestione Cloudflare."""
-        req_headers = dict(self.session.headers)
-        if headers:
-            req_headers.update(headers)
+        """Invia una richiesta HTTP (GET o POST) ritentando solo gli errori transitori.
 
-        last_exception: Optional[Exception] = None
+        Ritenta con backoff esponenziale errori di rete/timeout, HTTP 429, 403 (spesso
+        Cloudflare) e 5xx. Non stampa nulla: l'errore finale viene sollevato al chiamante.
+
+        Raises:
+            ResourceNotFoundError: HTTP 404/410, la risorsa non esiste.
+            requests.exceptions.HTTPError: altri errori 4xx, che ritentare non risolve.
+            SiteUnreachableError: sito irraggiungibile o errori transitori persistenti.
+        """
+        req_headers = self._site_headers(api=api, extra=headers)
+        last_error: Optional[Exception] = None
+        last_status: Optional[int] = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -97,30 +147,25 @@ class AnimeUnityScraper:
                         timeout=12,
                         allow_redirects=True,
                     )
-
-                if response.status_code in (403, 503):
-                    sys.stderr.write(
-                        f"\n{Colors.BRIGHT_YELLOW}{Icons.WARNING} Avviso AnimeUnity (HTTP {response.status_code}): "
-                        f"Possibile protezione Cloudflare attiva. Tentativo {attempt}/{self.max_retries}...{Colors.RESET}\n"
-                    )
-                    if attempt < self.max_retries:
-                        time.sleep(self.base_backoff * (2 ** (attempt - 1)))
-                        continue
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                last_error, last_status = exc, None
+            else:
+                status = response.status_code
+                if status < 400:
+                    return response
+                if status in (404, 410):
+                    raise ResourceNotFoundError(f"Risorsa non trovata (HTTP {status}): {url}")
+                if status not in RETRYABLE_STATUS and status < 500:
                     response.raise_for_status()
+                last_error, last_status = None, status
 
-                response.raise_for_status()
-                return response
+            if attempt < self.max_retries:
+                time.sleep(self.base_backoff * (2 ** (attempt - 1)))
 
-            except requests.exceptions.RequestException as exc:
-                last_exception = exc
-                if attempt < self.max_retries:
-                    time.sleep(self.base_backoff * (2 ** (attempt - 1)))
-                else:
-                    break
-
-        error_msg = f"Impossibile connettersi ad AnimeUnity ({url}): {last_exception}"
-        sys.stderr.write(f"\n{Colors.BRIGHT_RED}{Icons.ERROR} {error_msg}{Colors.RESET}\n")
-        raise requests.exceptions.ConnectionError(error_msg) from last_exception
+        if last_status is not None:
+            hint = " (possibile protezione Cloudflare)" if last_status == 403 else ""
+            raise SiteUnreachableError(f"AnimeUnity ha risposto HTTP {last_status}{hint}: {url}")
+        raise SiteUnreachableError(f"Impossibile connettersi ad AnimeUnity ({url}): {last_error}") from last_error
 
     def search_anime(self, query: str) -> list[dict[str, Any]]:
         """Cerca anime su AnimeUnity per titolo interrogando livesearch, archivio API e fallback HTML."""
@@ -135,12 +180,9 @@ class AnimeUnityScraper:
 
         api_headers = {
             "Content-Type": "application/json;charset=utf-8",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": ARCHIVE_ENDPOINT,
-            "Origin": BASE_URL,
+            "Referer": self.endpoints.archive,
+            "Origin": self.base_url,
         }
-        if self._csrf_token:
-            api_headers["X-CSRF-TOKEN"] = self._csrf_token
 
         # ----------------------------------------------------------------------
         # STRATEGIA 1: POST /archivio/get-animes (API interna del catalogo)
@@ -157,7 +199,7 @@ class AnimeUnityScraper:
                 "offset": 0,
                 "dubbed": False,
             }
-            resp = self._request_with_retry("POST", GET_ANIMES_ENDPOINT, json_data=payload, headers=api_headers)
+            resp = self._request_with_retry("POST", self.endpoints.get_animes, json_data=payload, headers=api_headers, api=True)
             data = resp.json()
             records = data.get("records") if isinstance(data, dict) else (data if isinstance(data, list) else [])
             if isinstance(records, list):
@@ -178,7 +220,7 @@ class AnimeUnityScraper:
         # ----------------------------------------------------------------------
         try:
             live_payload = {"title": clean_query}
-            resp = self._request_with_retry("POST", LIVESEARCH_ENDPOINT, json_data=live_payload, headers=api_headers)
+            resp = self._request_with_retry("POST", self.endpoints.livesearch, json_data=live_payload, headers=api_headers, api=True)
             live_data = resp.json()
             live_records = live_data.get("records") if isinstance(live_data, dict) else (live_data if isinstance(live_data, list) else [])
             if isinstance(live_records, list):
@@ -195,49 +237,11 @@ class AnimeUnityScraper:
             logger.debug("Tentativo livesearch fallito: %s", exc)
 
         # ----------------------------------------------------------------------
-        # STRATEGIA 3: Ricerca per variante o parola chiave (es. 'umamusume' -> 'uma musume' o 'uma')
-        # ----------------------------------------------------------------------
-        if not results:
-            fallback_query = clean_query
-            if "musume" in clean_query.lower() and " " not in clean_query:
-                fallback_query = clean_query.lower().replace("musume", " musume")
-            elif len(clean_query) > 5 and not " " in clean_query:
-                fallback_query = clean_query[:4]
-
-            if fallback_query != clean_query:
-                try:
-                    payload = {
-                        "title": fallback_query,
-                        "type": False,
-                        "year": False,
-                        "order": "Popolarità",
-                        "status": False,
-                        "genres": False,
-                        "season": False,
-                        "offset": 0,
-                        "dubbed": False,
-                    }
-                    resp = self._request_with_retry("POST", GET_ANIMES_ENDPOINT, json_data=payload, headers=api_headers)
-                    data = resp.json()
-                    records = data.get("records") if isinstance(data, dict) else []
-                    if isinstance(records, list):
-                        for item in records:
-                            if isinstance(item, dict):
-                                norm = self._normalize_anime_entry(item)
-                                if norm["id"] and norm["id"] not in seen_ids:
-                                    seen_ids.add(norm["id"])
-                                    results.append(norm)
-                except requests.exceptions.ConnectionError as exc:
-                    connection_errors.append(exc)
-                except Exception:
-                    pass
-
-        # ----------------------------------------------------------------------
-        # STRATEGIA 4: Fallback GET /archivio HTML con estrazione Vue / DOM
+        # STRATEGIA 3: Fallback GET /archivio HTML con estrazione Vue / DOM
         # ----------------------------------------------------------------------
         if not results:
             try:
-                resp = self._request_with_retry("GET", ARCHIVE_ENDPOINT, params={"title": clean_query})
+                resp = self._request_with_retry("GET", self.endpoints.archive, params={"title": clean_query})
                 html_text = resp.text
                 vue_animes = self._extract_vue_attribute(html_text, [":animes", "v-bind:animes"])
                 if vue_animes:
@@ -275,11 +279,16 @@ class AnimeUnityScraper:
         else:
             target_slug = f"{str_id}-{clean_slug}"
 
-        url = f"{INFO_ENDPOINT}/{target_slug}"
+        url = f"{self.endpoints.info}/{target_slug}"
         self._ensure_session()
 
         episodes: list[dict[str, Any]] = []
         seen_ep_numbers: set[Any] = set()
+        # Ultimo errore reale (rete/parsing) per fonte: serve a non confondere un
+        # guasto con una serie senza episodi.
+        api_error: Optional[Exception] = None
+        html_error: Optional[Exception] = None
+        api_chunks_loaded = 0
 
         # ----------------------------------------------------------------------
         # 1. Recupero episodi da info_api/{anime_id}/1 (API interna di AnimeUnity)
@@ -292,62 +301,30 @@ class AnimeUnityScraper:
 
         for _ in range(max_chunks):
             end_range = start_range + chunk_size - 1
-            info_url = f"{INFO_API_ENDPOINT}/{str_id}/1?start_range={start_range}&end_range={end_range}"
-            api_headers = {
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": url,
-            }
+            info_url = f"{self.endpoints.info_api}/{str_id}/1?start_range={start_range}&end_range={end_range}"
+            api_headers = {"Referer": url}
             try:
-                resp = self._request_with_retry("GET", info_url, headers=api_headers)
+                resp = self._request_with_retry("GET", info_url, headers=api_headers, api=True)
                 api_data = resp.json()
                 raw_eps = api_data.get("episodes") if isinstance(api_data, dict) else (api_data if isinstance(api_data, list) else [])
                 if not raw_eps or not isinstance(raw_eps, list):
                     break
 
-                for ep in raw_eps:
-                    if not isinstance(ep, dict):
+                for raw_ep in raw_eps:
+                    episode = self._build_episode(raw_ep)
+                    if episode is None or episode["number"] in seen_ep_numbers:
                         continue
-                    num_val = ep.get("number")
-                    if num_val is None:
-                        num_val = ep.get("id")
+                    seen_ep_numbers.add(episode["number"])
+                    episodes.append(episode)
 
-                    try:
-                        num_float = float(num_val)
-                        num_formatted = int(num_float) if num_float.is_integer() else num_float
-                    except (ValueError, TypeError):
-                        num_formatted = str(num_val)
-
-                    if num_formatted in seen_ep_numbers:
-                        continue
-                    seen_ep_numbers.add(num_formatted)
-
-                    raw_link = str(ep.get("link") or ep.get("scws_id") or ep.get("file_name") or "").strip()
-                    ep_id = ep.get("id") or num_formatted
-                    dead_hosts = ("animeunityserver", "animessvserver")
-
-                    # Se il link non è un URL HTTP valido o punta a CDN deprecate con SSL rotto, usa l'endpoint embed-url
-                    if (not raw_link.startswith("http") or any(d in raw_link for d in dead_hosts)) and ep.get("id"):
-                        link = f"{BASE_URL}/embed-url/{ep['id']}"
-                    else:
-                        link = raw_link
-
-                    ep_title = ep.get("title") or ep.get("name") or f"Episodio {num_formatted}"
-
-                    episodes.append({
-                        "id": ep_id,
-                        "number": num_formatted,
-                        "title": str(ep_title).strip(),
-                        "created_at": ep.get("created_at", ""),
-                        "file_name": ep.get("file_name", ""),
-                        "link": link,
-                    })
-
+                api_chunks_loaded += 1
                 # Se il blocco conteneva meno di chunk_size episodi, abbiamo finito
                 if len(raw_eps) < chunk_size:
                     break
                 start_range += chunk_size
             except Exception as exc:
                 logger.debug("Tentativo info_api blocco %d-%d fallito: %s", start_range, end_range, exc)
+                api_error = exc
                 break
 
         # ----------------------------------------------------------------------
@@ -378,7 +355,7 @@ class AnimeUnityScraper:
             # Immagine di copertina
             img_tag = soup.find("img", class_=re.compile(r"poster|cover|anime-image", re.I))
             if img_tag and img_tag.get("src"):
-                image_url = urljoin(BASE_URL, str(img_tag["src"]))
+                image_url = urljoin(self.base_url, str(img_tag["src"]))
 
             # Valutazione
             score_tag = soup.find(class_=re.compile(r"score|rating|vote", re.I))
@@ -432,56 +409,27 @@ class AnimeUnityScraper:
                     raw_episodes = self._extract_episodes_from_scripts(html_text)
 
                 if isinstance(raw_episodes, list):
-                    for ep in raw_episodes:
-                        if not isinstance(ep, dict):
+                    for raw_ep in raw_episodes:
+                        episode = self._build_episode(raw_ep)
+                        if episode is None or episode["number"] in seen_ep_numbers:
                             continue
-                        num_val = ep.get("number") or ep.get("id")
-                        try:
-                            num_float = float(num_val)
-                            num_formatted = int(num_float) if num_float.is_integer() else num_float
-                        except (ValueError, TypeError):
-                            num_formatted = str(num_val)
-
-                        if num_formatted in seen_ep_numbers:
-                            continue
-                        seen_ep_numbers.add(num_formatted)
-
-                        raw_link = str(ep.get("link") or ep.get("scws_id") or ep.get("file_name") or "").strip()
-                        ep_id = ep.get("id") or num_formatted
-                        dead_hosts = ("animeunityserver", "animessvserver")
-
-                        if (not raw_link.startswith("http") or any(d in raw_link for d in dead_hosts)) and ep.get("id"):
-                            link = f"{BASE_URL}/embed-url/{ep['id']}"
-                        else:
-                            link = raw_link
-
-                        ep_title = ep.get("title") or ep.get("name") or f"Episodio {num_formatted}"
-
-                        episodes.append({
-                            "id": ep_id,
-                            "number": num_formatted,
-                            "title": str(ep_title).strip(),
-                            "created_at": ep.get("created_at", ""),
-                            "file_name": ep.get("file_name", ""),
-                            "link": link,
-                        })
+                        seen_ep_numbers.add(episode["number"])
+                        episodes.append(episode)
 
         except Exception as exc:
             logger.debug("Errore durante il parsing HTML della scheda anime: %s", exc)
+            html_error = exc
 
         # ----------------------------------------------------------------------
-        # 4. Fallback estremo per film / opere con singolo episodio:
-        # Se ancora nessun episodio è stato trovato, creiamo l'episodio 1 diretto
+        # 4. Nessun episodio trovato: niente episodi inventati. L'ID dell'anime non è
+        # un ID episodio (partirebbe il video sbagliato) e un episodio finto nasconderebbe
+        # gli errori di rete. Se c'è stato un errore reale lo si propaga così com'è.
         # ----------------------------------------------------------------------
         if not episodes:
-            episodes.append({
-                "id": str_id,
-                "number": 1,
-                "title": title or "Film / Episodio Unico",
-                "created_at": "",
-                "file_name": "",
-                "link": f"{BASE_URL}/embed-url/{str_id}",
-            })
+            failure = html_error or api_error
+            if failure is not None:
+                raise failure
+            raise EpisodesNotFoundError(f"Nessun episodio disponibile per '{title}' (id {str_id}).")
 
         # Ordina episodi per numero crescente
         def get_sort_key(item: dict[str, Any]) -> float:
@@ -491,6 +439,10 @@ class AnimeUnityScraper:
                 return 0.0
 
         episodes.sort(key=get_sort_key)
+
+        # Un errore dopo aver già caricato almeno un blocco da info_api significa che la
+        # lista è troncata: va segnalato, non presentato come completa.
+        partial = api_error is not None and api_chunks_loaded > 0
 
         return {
             "id": str_id,
@@ -502,11 +454,48 @@ class AnimeUnityScraper:
             "genres": genres,
             "total_episodes": len(episodes),
             "episodes": episodes,
+            "partial": partial,
+            "partial_reason": str(api_error) if partial else "",
         }
 
     # ==========================================================================
     # METODI DI SUPPORTO PER IL PARSING
     # ==========================================================================
+
+    def _build_episode(self, raw: Any) -> Optional[dict[str, Any]]:
+        """Normalizza un episodio grezzo (da info_api o dall'HTML) nella struttura interna.
+
+        Restituisce None se `raw` non è un dizionario. Il numero 0 è valido: si ricorre
+        all'ID solo se il numero manca (`is None`), mai per valori "falsy".
+        """
+        if not isinstance(raw, dict):
+            return None
+
+        number_raw = raw.get("number")
+        if number_raw is None:
+            number_raw = raw.get("id")
+        number: Any = normalize_episode_number(number_raw)
+        if number is None:
+            number = str(number_raw)
+
+        raw_link = str(raw.get("link") or raw.get("scws_id") or raw.get("file_name") or "").strip()
+        dead_hosts = ("animeunityserver", "animessvserver")
+
+        # Se il link non è un URL HTTP valido o punta a CDN deprecate con SSL rotto, usa l'endpoint embed-url
+        if (not raw_link.startswith("http") or any(d in raw_link for d in dead_hosts)) and raw.get("id"):
+            link = f"{self.endpoints.embed_url}/{raw['id']}"
+        else:
+            link = raw_link
+
+        title = raw.get("title") or raw.get("name") or f"Episodio {number}"
+        return {
+            "id": raw.get("id") or number,
+            "number": number,
+            "title": str(title).strip(),
+            "created_at": raw.get("created_at", ""),
+            "file_name": raw.get("file_name", ""),
+            "link": link,
+        }
 
     def _extract_vue_attribute(self, html_text: str, attr_names: list[str]) -> Optional[Any]:
         """Cerca e decodifica attributi Vue con payload JSON (es. :animes='[...]')."""
@@ -571,7 +560,7 @@ class AnimeUnityScraper:
             img = a.find("img")
             img_url = ""
             if img:
-                img_url = urljoin(BASE_URL, str(img.get("src") or img.get("data-src") or ""))
+                img_url = urljoin(self.base_url, str(img.get("src") or img.get("data-src") or ""))
                 if not title and img.get("alt"):
                     title = str(img.get("alt")).strip()
 
@@ -587,6 +576,7 @@ class AnimeUnityScraper:
                 "year": "N/D",
                 "episodes_count": "?",
                 "status": "In corso",
+                "dub": slug.endswith("-ita"),
                 "image_url": img_url,
                 "plot": "",
                 "score": "",
@@ -609,20 +599,16 @@ class AnimeUnityScraper:
         name_main = str(raw.get("title") or raw.get("name") or "").strip()
 
         # Genera un fallback leggibile basato sullo slug
-        clean_slug_name = (
-            slug.replace("-ita", " (ITA)")
-            .replace("-sub-ita", " (SUB)")
-            .replace("-", " ")
-            .title()
-        )
+        clean_slug_name = title_from_slug(slug)
 
         # Selezione gerarchica del titolo per non avere mai "Senza Titolo"
         title = name_it or name_eng or name_main or name_orig or clean_slug_name or f"Anime {anime_id}"
         title_eng = name_eng or name_orig or (name_it if name_it != title else "")
 
-        image_url = raw.get("image_url") or raw.get("image") or raw.get("cover") or ""
+        # L'API di AnimeUnity usa `imageurl` (verificato dal vivo); `cover` è sempre null
+        image_url = raw.get("imageurl") or raw.get("image_url") or raw.get("image") or raw.get("cover") or ""
         if image_url and not image_url.startswith(("http://", "https://")):
-            image_url = urljoin(BASE_URL, image_url)
+            image_url = urljoin(self.base_url, image_url)
 
         episodes_count = raw.get("episodes_count") or raw.get("episodes") or "?"
         if isinstance(episodes_count, list):
@@ -649,6 +635,7 @@ class AnimeUnityScraper:
             "year": str(raw.get("date") or raw.get("year") or "N/D"),
             "episodes_count": str(episodes_count),
             "status": str(raw.get("status") or "Terminato"),
+            "dub": bool(raw.get("dub")),
             "image_url": image_url,
             "plot": str(raw.get("plot") or raw.get("description") or ""),
             "score": score,

@@ -1,19 +1,54 @@
 """Costanti globali, endpoint di AnimeUnity, template e codici ANSI per ani-it."""
 
+from dataclasses import dataclass
 from typing import Final
+
+from ani_it._version import __version__
 
 # Informazioni applicazione
 APP_NAME: Final[str] = "ani-it"
-APP_VERSION: Final[str] = "1.0.0"
+APP_VERSION: Final[str] = __version__
 
-# Endpoint AnimeUnity
-BASE_URL: Final[str] = "https://www.animeunity.so"
-ARCHIVE_ENDPOINT: Final[str] = f"{BASE_URL}/archivio"
-INFO_ENDPOINT: Final[str] = f"{BASE_URL}/anime"
-EMBED_ENDPOINT: Final[str] = f"{BASE_URL}/embed-pc"
-LIVESEARCH_ENDPOINT: Final[str] = f"{BASE_URL}/livesearch"
-GET_ANIMES_ENDPOINT: Final[str] = f"{BASE_URL}/archivio/get-animes"
-INFO_API_ENDPOINT: Final[str] = f"{BASE_URL}/info_api"
+# Endpoint AnimeUnity. Il dominio cambia spesso: quello predefinito è sovrascrivibile da
+# `general.base_url` in config.toml, e gli endpoint si derivano con Endpoints(base_url).
+DEFAULT_BASE_URL: Final[str] = "https://www.animeunity.so"
+BASE_URL: Final[str] = DEFAULT_BASE_URL
+
+
+@dataclass(frozen=True)
+class Endpoints:
+    """Endpoint di AnimeUnity derivati da un dominio base."""
+
+    base_url: str
+
+    @property
+    def archive(self) -> str:
+        return f"{self.base_url}/archivio"
+
+    @property
+    def info(self) -> str:
+        return f"{self.base_url}/anime"
+
+    @property
+    def embed_url(self) -> str:
+        return f"{self.base_url}/embed-url"
+
+    @property
+    def embed_pc(self) -> str:
+        return f"{self.base_url}/embed-pc"
+
+    @property
+    def livesearch(self) -> str:
+        return f"{self.base_url}/livesearch"
+
+    @property
+    def get_animes(self) -> str:
+        return f"{self.base_url}/archivio/get-animes"
+
+    @property
+    def info_api(self) -> str:
+        return f"{self.base_url}/info_api"
+
 
 # Header di navigazione realistici
 DEFAULT_USER_AGENT: Final[str] = (
@@ -21,21 +56,26 @@ DEFAULT_USER_AGENT: Final[str] = (
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
-DEFAULT_HEADERS: Final[dict[str, str]] = {
-    "User-Agent": DEFAULT_USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": BASE_URL,
-    "Origin": BASE_URL,
-    "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Linux"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
+def site_headers(base_url: str = DEFAULT_BASE_URL) -> dict[str, str]:
+    """Header di navigazione per le richieste verso AnimeUnity (Referer/Origin dal dominio base)."""
+    return {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": base_url,
+        "Origin": base_url,
+        "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Linux"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
+DEFAULT_HEADERS: Final[dict[str, str]] = site_headers(DEFAULT_BASE_URL)
 
 # Codici Colori ANSI ed Escape Sequences
 class Colors:
@@ -111,8 +151,8 @@ class Icons:
     ROCKET: Final[str] = "󰛡"       # nf-md-rocket
 
 
-# Nome socket predefinito
-DEFAULT_SOCKET_NAME: Final[str] = "ani-it-mpv.sock"
+# Nome del socket IPC di mpv: include il PID così più istanze non si cancellano il socket a vicenda
+SOCKET_NAME_TEMPLATE: Final[str] = "ani-it-mpv-{pid}.sock"
 
 # Formati stream riconosciuti
 FORMAT_HLS: Final[str] = "hls"

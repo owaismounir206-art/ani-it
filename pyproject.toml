@@ -1,16 +1,17 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ani-it"
-version = "1.0.0"
+dynamic = ["version"]
 description = "CLI/TUI nativo per lo streaming e download di anime da AnimeUnity in italiano"
 readme = "README.md"
 authors = [
     { name = "ani-it contributors" }
 ]
-license = { text = "GPL-3.0-or-later" }
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "requests>=2.28.0",
@@ -20,20 +21,35 @@ keywords = ["anime", "tui", "cli", "streaming", "mpv", "fzf", "animeunity", "arc
 classifiers = [
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Video",
 ]
 
 [project.scripts]
 ani-it = "ani_it.cli:main"
 
+[tool.setuptools.dynamic]
+# Unica fonte della versione: ani_it/_version.py (letto senza importare il pacchetto)
+version = { attr = "ani_it._version.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ani_it*"]
 exclude = ["tests*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["build", "dist", "pkg", "src"]
+
+[tool.ruff.lint]
+# E/W: stile, F: pyflakes (import inutilizzati, variabili morte), B: bug probabili
+select = ["E", "F", "W", "B"]
+# Le righe lunghe (messaggi e stringhe ANSI) sono frequenti e volute
+ignore = ["E501"]
 
 [project.urls]
 Homepage = "https://github.com/owaismounir206-art/ani-it"

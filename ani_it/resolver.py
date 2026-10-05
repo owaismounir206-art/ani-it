@@ -4,22 +4,27 @@ import html
 import logging
 import re
 from typing import Any, Optional
-import urllib.parse
-from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import requests
 
-from ani_it.constants import BASE_URL, DEFAULT_USER_AGENT, FORMAT_HLS, FORMAT_MP4
-from ani_it.utils import unpack_js
+from ani_it.constants import DEFAULT_BASE_URL, DEFAULT_USER_AGENT, FORMAT_HLS, FORMAT_MP4, Endpoints
+from ani_it.utils import quality_height, unpack_js
 
 logger = logging.getLogger("ani_it.resolver")
 
 
+# Caratteri validi nel path che non vanno codificati; '%' resta per non toccare le sequenze già codificate
+_PATH_SAFE = "/:@!$'()*+,;=%"
+
+
 def sanitize_stream_url(url: str) -> str:
     """Sanifica e codifica i caratteri speciali nel path dell'URL (es. spazi, '&').
-    
+
     Preserva scheme, host, porta, query string e frammenti, codificando solo i caratteri
     del path che potrebbero causare errori con web server, CDN o downloader esterni.
+    Le sequenze già codificate (es. `%2F`) restano intatte: decodificarle e ricodificarle
+    altererebbe gli URL firmati, la cui firma dipende dal path esatto.
     """
     if not url:
         return ""
@@ -28,8 +33,9 @@ def sanitize_stream_url(url: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return url
 
-    # Quote path preservando i separatori validi (/ : @) e codificando '&' o spazi se presenti nel filename
-    clean_path = quote(unquote(parsed.path), safe="/:@!$'()*+,;=")
+    # Un '%' non seguito da due cifre esadecimali è un carattere letterale: va codificato
+    path = re.sub(r"%(?![0-9A-Fa-f]{2})", "%25", parsed.path)
+    clean_path = quote(path, safe=_PATH_SAFE)
     clean_query = parsed.query.strip()
     return urlunsplit((
         parsed.scheme,
@@ -40,42 +46,16 @@ def sanitize_stream_url(url: str) -> str:
     ))
 
 
-def verify_and_fallback_protocol(url: str, session: Optional[requests.Session] = None) -> str:
-    """Verifica la raggiungibilità del server multimediale su HTTPS (porta 443).
-    
-    Se la connessione viene rifiutata (Errno 111 Connection Refused) o fallisce con SSLError,
-    esegue il downgrade immediato a HTTP (porta 80).
-    """
-    if not url.startswith("https://"):
-        return url
-
-    sess = session or requests.Session()
-    headers = {"User-Agent": DEFAULT_USER_AGENT, "Range": "bytes=0-0"}
-
-    try:
-        sess.get(url, headers=headers, timeout=2.5, stream=True, allow_redirects=True)
-        return url
-    except (requests.exceptions.SSLError, requests.exceptions.ConnectionError):
-        # Il server non ha un listener TLS su 443 o la porta è chiusa
-        http_url = "http://" + url[len("https://"):]
-        try:
-            sess.get(http_url, headers=headers, timeout=2.5, stream=True, allow_redirects=True)
-            logger.info("Protocol downgrade riuscito: %s -> %s", url, http_url)
-            return http_url
-        except Exception:
-            return url
-    except Exception:
-        return url
-
-
 class StreamResolver:
     """Estrae l'URL sorgente del flusso multimediale (HLS .m3u8 o MP4) da embed e player."""
 
-    def __init__(self, session: Optional[requests.Session] = None) -> None:
+    def __init__(self, session: Optional[requests.Session] = None, base_url: str = DEFAULT_BASE_URL) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.endpoints = Endpoints(self.base_url)
         self.session = session or requests.Session()
         self.session.headers.update({
             "User-Agent": DEFAULT_USER_AGENT,
-            "Referer": BASE_URL,
+            "Referer": self.base_url,
         })
 
     def resolve(
@@ -111,29 +91,38 @@ class StreamResolver:
 
         if is_hls or is_direct_video:
             clean_url = sanitize_stream_url(link)
-            verified_url = verify_and_fallback_protocol(clean_url, self.session)
+
+            # Alcuni film hanno link diretti verso host morti (nessuna porta in ascolto): lo stesso
+            # episodio si raggiunge da /embed-url/{id}. Una sola sonda, solo per i file diretti.
+            if is_direct_video and episode_id and not self._host_is_reachable(clean_url):
+                alternative = self._resolve_via_embed_url(episode_id, quality)
+                if alternative is not None:
+                    return alternative
+
             fmt = FORMAT_HLS if is_hls else FORMAT_MP4
-            return self._build_result(verified_url, fmt, referer=BASE_URL)
+            bitrate = self._hls_bitrate_for_quality(clean_url, self.base_url, quality) if is_hls else None
+            return self._build_result(clean_url, fmt, referer=self.base_url, hls_bitrate=bitrate)
 
         # 3. Se è un path relativo (es. /embed-pc/123 o /embed/123)
         if link.startswith("/"):
-            link = urljoin(BASE_URL, link)
+            link = urljoin(self.base_url + "/", link)
 
         # Se il link è solo un ID numerico o scws_id
         if link.isdigit():
-            link = f"{BASE_URL}/embed-url/{link}"
+            numeric_id = link  # l'ID originale serve anche al fallback: `link` viene riassegnato
+            link = f"{self.endpoints.embed_url}/{numeric_id}"
             try:
                 resp = self.session.get(link, timeout=10)
                 if resp.status_code == 200 and resp.text.strip().startswith("http"):
                     link = resp.text.strip()
             except Exception:
-                link = f"{BASE_URL}/embed-pc/{link}"
+                link = f"{self.endpoints.embed_pc}/{numeric_id}"
 
         # 4. Effettua richiesta GET al player embed
         headers = {
             "User-Agent": DEFAULT_USER_AGENT,
-            "Referer": BASE_URL,
-            "Origin": BASE_URL,
+            "Referer": self.base_url,
+            "Origin": self.base_url,
         }
 
         try:
@@ -143,7 +132,7 @@ class StreamResolver:
         except Exception as exc:
             # Se la richiesta al player fallisce e abbiamo episode_id, tenta endpoint embed-url
             if episode_id:
-                fb_endpoint = f"{BASE_URL}/embed-url/{episode_id}"
+                fb_endpoint = f"{self.endpoints.embed_url}/{episode_id}"
                 try:
                     fb_resp = self.session.get(fb_endpoint, timeout=10)
                     if fb_resp.status_code == 200 and fb_resp.text.strip().startswith("http"):
@@ -182,7 +171,7 @@ class StreamResolver:
 
         # Fallback a embed-url se l'estrazione non ha prodotto stream e c'è episode_id
         if not stream_url and episode_id:
-            fb_endpoint = f"{BASE_URL}/embed-url/{episode_id}"
+            fb_endpoint = f"{self.endpoints.embed_url}/{episode_id}"
             try:
                 fb_resp = self.session.get(fb_endpoint, timeout=10)
                 if fb_resp.status_code == 200 and fb_resp.text.strip().startswith("http"):
@@ -196,13 +185,83 @@ class StreamResolver:
         # 7. Estrazione eventuali tracce sottotitoli
         subtitles = self._extract_subtitles(content, current_url)
 
-        # 8. Risoluzione della qualità se è un master m3u8 con varianti
-        final_stream_url = self._select_stream_quality(stream_url, current_url, quality)
+        # 8. Qualità: il master HLS resta intatto (così non si perdono le tracce audio
+        # separate); la variante viene scelta da mpv con --hls-bitrate.
+        bitrate = None
+        if fmt == FORMAT_HLS:
+            bitrate = self._hls_bitrate_for_quality(sanitize_stream_url(stream_url), current_url, quality)
 
-        return self._build_result(final_stream_url, fmt, referer=current_url, subtitles=subtitles)
+        return self._build_result(stream_url, fmt, referer=current_url, subtitles=subtitles, hls_bitrate=bitrate)
+
+    def _host_is_reachable(self, url: str) -> bool:
+        """True se l'host risponde (con qualsiasi stato HTTP); False se la connessione fallisce.
+
+        Una sola richiesta HEAD con timeout breve, chiusa subito. Non cambia mai il protocollo:
+        serve soltanto a scegliere fra il link diretto e l'alternativa /embed-url.
+        """
+        try:
+            response = self.session.head(url, headers={"User-Agent": DEFAULT_USER_AGENT}, timeout=4, allow_redirects=True)
+        except requests.exceptions.RequestException as exc:
+            logger.debug("Host del link diretto non raggiungibile (%s): %s", url, exc)
+            return False
+        response.close()
+        return True
+
+    def _resolve_via_embed_url(self, episode_id: str | int, quality: str) -> Optional[dict[str, Any]]:
+        """Risolve un episodio dal suo endpoint embed-url; None se non disponibile."""
+        try:
+            resp = self.session.get(f"{self.endpoints.embed_url}/{episode_id}", timeout=10)
+            if resp.status_code == 200 and resp.text.strip().startswith("http"):
+                return self.resolve(resp.text.strip(), quality=quality)
+        except Exception as exc:
+            logger.debug("Fallback embed-url fallito per l'episodio %s: %s", episode_id, exc)
+        return None
+
+    @staticmethod
+    def _extract_master_playlist(content: str, base_url: str) -> Optional[str]:
+        """Ricostruisce l'URL HLS dal blocco `window.masterPlaylist` degli embed Vixcloud.
+
+        La pagina espone `{ params: {token, expires, asn}, url: '.../playlist/ID' }` senza
+        estensione .m3u8: l'URL reale è `url?token=...&expires=...` (più `h=1` se la pagina
+        dichiara `window.canPlayFHD = true`; senza di esso il server risponde 403).
+        """
+        start = re.search(r"window\.masterPlaylist\s*=\s*\{", content)
+        if not start:
+            return None
+
+        # Il blocco termina alla successiva assegnazione `window.`
+        end = content.find("window.", start.end())
+        block = content[start.end():end if end != -1 else None]
+
+        url_match = re.search(r"\burl\s*:\s*['\"]([^'\"]+)['\"]", block)
+        if not url_match:
+            return None
+        base = html.unescape(url_match.group(1).replace(r"\/", "/")).strip()
+        if not base.startswith("http"):
+            base = urljoin(base_url, base)
+
+        params: dict[str, str] = {}
+        params_match = re.search(r"\bparams\s*:\s*\{(.*?)\}", block, re.DOTALL)
+        if params_match:
+            for key, value in re.findall(r"['\"]?(\w+)['\"]?\s*:\s*['\"]([^'\"]*)['\"]", params_match.group(1)):
+                if value:  # i parametri vuoti (es. asn) vengono omessi
+                    params[key] = value
+
+        if re.search(r"window\.canPlayFHD\s*=\s*true", content):
+            params["h"] = "1"
+
+        if not params:
+            return base
+        return base + ("&" if "?" in base else "?") + urlencode(params)
 
     def _extract_stream_url(self, content: str, base_url: str) -> tuple[Optional[str], str]:
         """Scansiona il contenuto HTML/JS per identificare flussi .m3u8 o .mp4."""
+        # Embed Vixcloud: la playlist HLS non ha estensione e va prima dei pattern generici
+        # (che altrimenti pescherebbero l'MP4 di `window.downloadUrl`).
+        master_playlist = self._extract_master_playlist(content, base_url)
+        if master_playlist:
+            return master_playlist, FORMAT_HLS
+
         # Pattern HLS .m3u8
         hls_patterns = [
             r'masterUrl\s*=\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
@@ -269,49 +328,43 @@ class StreamResolver:
 
         return subtitles
 
-    def _select_stream_quality(self, stream_url: str, referer: str, requested_quality: str) -> str:
-        """Se lo stream è un playlist master m3u8, seleziona la variante con la risoluzione richiesta."""
-        if requested_quality == "best" or not stream_url.endswith(".m3u8"):
-            return stream_url
+    def _hls_bitrate_for_quality(self, master_url: str, referer: str, requested_quality: str) -> Optional[int]:
+        """Restituisce il BANDWIDTH della variante del master più adatta alla qualità richiesta.
+
+        Sceglie la variante più alta che non supera l'altezza richiesta (o la più bassa se
+        tutte la superano). Restituisce None per 'best', per playlist non parsabili o su
+        errore di rete: in tutti questi casi si lascia scegliere al player.
+        """
+        target_height = quality_height(requested_quality)
+        if target_height is None:
+            return None
 
         try:
             resp = self.session.get(
-                stream_url,
+                master_url,
                 headers={"Referer": referer, "User-Agent": DEFAULT_USER_AGENT},
                 timeout=5,
             )
             playlist = resp.text
-            if "#EXT-X-STREAM-INF" not in playlist:
-                return stream_url
+        except Exception as exc:
+            logger.debug("Playlist master non raggiungibile per la scelta qualità: %s", exc)
+            return None
 
-            # Parsing delle varianti m3u8
-            lines = playlist.splitlines()
-            variants: list[tuple[int, str]] = []  # (resolution_height, url)
-            current_height = 0
+        variants: list[tuple[int, int]] = []  # (altezza, bandwidth)
+        for line in playlist.splitlines():
+            if not line.startswith("#EXT-X-STREAM-INF"):
+                continue
+            height = re.search(r"RESOLUTION=\d+x(\d+)", line)
+            bandwidth = re.search(r"(?<![\w-])BANDWIDTH=(\d+)", line)
+            if height and bandwidth:
+                variants.append((int(height.group(1)), int(bandwidth.group(1))))
 
-            for line in lines:
-                line = line.strip()
-                if line.startswith("#EXT-X-STREAM-INF"):
-                    res_match = re.search(r"RESOLUTION=\d+x(\d+)", line)
-                    if res_match:
-                        current_height = int(res_match.group(1))
-                    else:
-                        current_height = 0
-                elif line and not line.startswith("#"):
-                    variant_url = urljoin(stream_url, line)
-                    variants.append((current_height, variant_url))
+        if not variants:
+            return None
 
-            if not variants:
-                return stream_url
-
-            # Cerca corrispondenza per la qualità richiesta (es. '1080p' -> 1080)
-            target_h = int(re.sub(r"\D", "", requested_quality)) if re.search(r"\d+", requested_quality) else 1080
-            # Ordina per distanza dalla qualità richiesta
-            variants.sort(key=lambda item: abs(item[0] - target_h) if item[0] > 0 else 9999)
-            return variants[0][1]
-
-        except Exception:
-            return stream_url
+        within = [v for v in variants if v[0] <= target_height]
+        chosen = max(within) if within else min(variants)
+        return chosen[1]
 
     def _build_result(
         self,
@@ -319,12 +372,14 @@ class StreamResolver:
         fmt: str,
         referer: str,
         subtitles: Optional[list[dict[str, Any]]] = None,
+        hls_bitrate: Optional[int] = None,
     ) -> dict[str, Any]:
         """Costruisce il payload finale strutturato con gli header indispensabili per la riproduzione."""
         clean_url = sanitize_stream_url(stream_url)
-        clean_url = verify_and_fallback_protocol(clean_url, self.session)
-        domain = urlparse(referer).netloc or "www.animeunity.so"
-        origin = f"https://{domain}"
+        parsed_referer = urlparse(referer)
+        origin = (
+            f"{parsed_referer.scheme}://{parsed_referer.netloc}" if parsed_referer.netloc else self.base_url
+        )
 
         return {
             "stream_url": clean_url,
@@ -335,4 +390,5 @@ class StreamResolver:
             },
             "format": fmt,
             "subtitles": subtitles or [],
+            "hls_bitrate": hls_bitrate,
         }
