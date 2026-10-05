@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Arch Linux packaging
+pkg/
+src/
+*.pkg.tar.*
+*.pkg.tar.zst
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Caches and temporary files
+.cache/
+.pytest_cache/
+*.tmp
+*.tmp.*
+*.part
+*.aria2
+test.txt
