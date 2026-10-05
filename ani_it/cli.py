@@ -98,6 +98,17 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "-t",
+        "--terminal",
+        dest="terminal_vo",
+        nargs="?",
+        const="tct",
+        choices=["tct", "kitty", "sixel", "caca"],
+        default=None,
+        help="Riproduci il video direttamente nel terminale ('tct', 'kitty', 'sixel', 'caca').",
+    )
+
+    parser.add_argument(
         "--clear-history",
         action="store_true",
         help="Svuota completamente il database della cronologia locale.",
@@ -418,6 +429,10 @@ def main() -> None:
     if args.quality:
         q_val = args.quality if (args.quality.endswith("p") or args.quality == "best") else f"{args.quality}p"
         config.general.quality = q_val
+
+    # Sovrascrittura output video da terminale (-t / --terminal)
+    if args.terminal_vo:
+        config.player.args = [f"--vo={args.terminal_vo}", "--force-window=no"] + config.player.args
 
     # Banner introduttivo moderno
     ui.print_banner()

@@ -10,6 +10,7 @@ _ani_it() {
         '(-d --download)'{-d,--download}'[Attiva la modalità download]' \
         '(-e --episode)'{-e,--episode}'[Numero di episodio o intervallo (es. 1 o 1-12)]:episodio:_values "episodio"' \
         '(-q --quality)'{-q,--quality}'[Forza risoluzione video]:qualità:(1080p 720p 480p best)' \
+        '(-t --terminal)'{-t,--terminal}'[Riproduci il video nel terminale]:driver:(tct kitty sixel caca)' \
         '--clear-history[Svuota il database della cronologia locale]' \
         '--clear-cache[Pulisce la cache delle locandine e metadati]' \
         '(-v --version)'{-v,--version}'[Stampa la versione del programma ed esce]' \

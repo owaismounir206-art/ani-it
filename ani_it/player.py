@@ -268,8 +268,16 @@ class MpvController:
         if hls_bitrate:
             cmd.append(f"--hls-bitrate={int(hls_bitrate)}")
 
+        # Rileva se è richiesto il rendering del video direttamente nel terminale
+        is_terminal_vo = any(
+            any(vo in arg for vo in ("--vo=tct", "--vo=kitty", "--vo=sixel", "--vo=caca"))
+            for arg in (*vo_args, *self.config.player.args)
+        )
+
+        window_args = ["--force-window=no"] if is_terminal_vo else ["--force-window=immediate"]
+
         cmd += [
-            "--force-window=immediate",
+            *window_args,
             # mpv non verifica i certificati TLS di default: come per aria2c e yt-dlp, va chiesto
             "--tls-verify=yes",
             # Solo gli errori nel log (mpv li scrive su stdout): niente riga di stato
@@ -285,6 +293,39 @@ class MpvController:
 
         if start_time and start_time > 0:
             cmd.append(f"--start={int(start_time)}")
+
+        if is_terminal_vo:
+            # Per il video nel terminale, stdout/stdin non devono essere rediretti a file temporanei
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=None,
+                    stdout=None,
+                    stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"Il lettore video '{self.config.player.binary}' non è installato sul sistema.\n"
+                    "Installalo con: sudo pacman -S mpv"
+                ) from None
+
+            SignalHandler.register_process(proc)
+
+            ipc = MpvIpcClient(self.socket_path)
+            try:
+                last_pos, duration, percent, eof_reached = self._monitor(proc, ipc, quit_on_eof)
+            finally:
+                SignalHandler.unregister_process(proc)
+                ipc.close()
+                self._cleanup_socket()
+
+            return PlaybackResult(
+                status=self._classify_exit(proc.returncode, eof_reached, percent),
+                time_pos=last_pos,
+                duration=duration,
+                percent_pos=percent,
+                error_output="",
+            )
 
         # L'output di mpv va in un file temporaneo (non in una pipe, che bloccherebbe mpv
         # se piena): serve a mostrare all'utente il motivo di un errore di riproduzione.

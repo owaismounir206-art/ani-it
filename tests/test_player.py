@@ -209,10 +209,12 @@ class TestMpvController(unittest.TestCase):
         proc.poll.side_effect = [None] * polls + [retcode] * 50
         proc.returncode = retcode
 
-        def fake_popen(cmd, stdout=None, stderr=None, **kwargs):
+        def fake_popen(cmd, stdout=None, stderr=None, stdin=None, **kwargs):
             self.cmd = cmd
-            # mpv scrive i suoi messaggi su stdout: il player li deve catturare lì
+            self.stdout_arg = stdout
             self.stderr_arg = stderr
+            self.stdin_arg = stdin
+            # mpv scrive i suoi messaggi su stdout: il player li deve catturare lì
             if log_text and hasattr(stdout, "write"):
                 stdout.write(log_text)
                 stdout.flush()
@@ -246,6 +248,15 @@ class TestMpvController(unittest.TestCase):
         for arg in self.cmd:
             self.assertNotEqual(arg, "--referrer=")
             self.assertNotEqual(arg, "--user-agent=")
+
+    def test_terminal_vo_sets_force_window_no_and_direct_stdio(self) -> None:
+        self.controller.config.player.args = ["--vo=tct"]
+        self._play(0)
+        self.assertIn("--force-window=no", self.cmd)
+        self.assertNotIn("--force-window=immediate", self.cmd)
+        self.assertIsNone(self.stdout_arg)
+        self.assertIsNone(self.stdin_arg)
+        self.assertEqual(self.stderr_arg, subprocess.DEVNULL)
 
     # --- codici di uscita --------------------------------------------------
 

@@ -503,5 +503,19 @@ class TestDownloadMode(CliHarness):
         self.assertEqual(self.downloader.download_range.call_args.kwargs["anime_title"], "Serie Test")
 
 
+class TestTerminalVoWiring(CliHarness):
+    def test_default_terminal_flag_injects_tct_and_force_window_no(self) -> None:
+        config = Config()
+        self.run_main(argv=["ani-it", "serie", "-t"], config=config)
+        self.assertIn("--vo=tct", config.player.args)
+        self.assertIn("--force-window=no", config.player.args)
+
+    def test_custom_terminal_driver_kitty(self) -> None:
+        config = Config()
+        self.run_main(argv=["ani-it", "serie", "--terminal=kitty"], config=config)
+        self.assertIn("--vo=kitty", config.player.args)
+        self.assertIn("--force-window=no", config.player.args)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,11 +5,15 @@ _ani_it_completions() {
     local cur prev words cword
     _init_completion || return
 
-    local opts="-c --continue -h -H --history -d --download -e --episode -q --quality --clear-history --clear-cache -v --version --help"
+    local opts="-c --continue -h -H --history -d --download -e --episode -q --quality -t --terminal --clear-history --clear-cache -v --version --help"
 
     case "${prev}" in
         -q|--quality)
             COMPREPLY=( $(compgen -W "1080p 720p 480p best" -- "${cur}") )
+            return 0
+            ;;
+        -t|--terminal)
+            COMPREPLY=( $(compgen -W "tct kitty sixel caca" -- "${cur}") )
             return 0
             ;;
         -e|--episode)

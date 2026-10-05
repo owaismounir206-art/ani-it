@@ -136,6 +136,12 @@ ani-it -d -e 1-12 "Frieren"
 # Forza una risoluzione specifica (es. 720p, 1080p, best)
 ani-it -q 720 "Attack on Titan"
 
+# Riproduzione video direttamente nel terminale (senza finestra grafica esterna)
+ani-it -t "Steins;Gate"         # Driver predefinito 'tct' (True Color Terminal, blocchi Unicode RGB)
+ani-it -t kitty "Cyberpunk"     # Grafica pixel Kitty (per Kitty, Ghostty, WezTerm)
+ani-it -t sixel "Bocchi"        # Grafica Sixel (per Foot, WezTerm)
+ani-it -t caca "Evangelion"     # Modalità ASCII color art
+
 # Pulizia dei dati
 ani-it --clear-history   # Azzera la cronologia
 ani-it --clear-cache     # Pulisce la cache delle immagini e dei metadati
