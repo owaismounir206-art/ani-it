@@ -168,6 +168,43 @@ Se lo stream non si risolve o `mpv` non riesce a riprodurlo, un menu dedicato mo
 
 ---
 
+## 🗑️ Disinstallazione e Rimozione Completa
+
+Se desideri rimuovere `ani-it` dal tuo sistema, segui i passaggi corrispondenti al tuo metodo di installazione:
+
+### 1. Rimozione dell'Eseguibile
+
+#### Se installato tramite pacchetto Arch Linux (`makepkg` o `pacman`):
+```bash
+sudo pacman -Rns ani-it
+```
+*(L'opzione `-Rns` rimuove l'eseguibile, le shell completions e tutte le dipendenze non più utilizzate da altri programmi).*
+
+#### Se installato tramite Pip:
+```bash
+pip uninstall ani-it
+```
+
+---
+
+### 2. Rimozione di Dati, Cache e Configurazioni (Opzionale)
+`ani-it` rispetta rigorosamente le specifiche **XDG Base Directory**. Per rimuovere completamente tutti i dati locali generati dal programma:
+
+```bash
+# 1. Rimuovi le impostazioni personalizzate
+rm -rf ~/.config/ani-it
+
+# 2. Rimuovi la cronologia degli anime visti
+rm -rf ~/.local/state/ani-it
+
+# 3. Rimuovi la cache locale (locandine scaricate da chafa, sessioni temporanee)
+rm -rf ~/.cache/ani-it
+```
+
+*(I video scaricati in `~/Downloads/Anime/` non vengono toccati e rimangono al sicuro).*
+
+---
+
 ## 🧪 Sviluppo
 
 ```bash
