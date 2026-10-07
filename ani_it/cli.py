@@ -24,6 +24,7 @@ from ani_it.scraper import AnimeUnityScraper, EpisodesNotFoundError
 from ani_it.ui import FzfUI
 from ani_it.utils import (
     SignalHandler,
+    enable_windows_ansi,
     format_duration,
     get_cache_dir,
     normalize_episode_number,
@@ -387,6 +388,7 @@ def play_episodes(
 def main() -> None:
     """Punto di ingresso principale della CLI."""
     SignalHandler.install()
+    enable_windows_ansi()
 
     # Il parsing viene prima di tutto: --help, --version e gli errori di sintassi escono qui
     # senza aver creato config, cronologia o cache.

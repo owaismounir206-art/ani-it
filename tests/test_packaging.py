@@ -69,9 +69,9 @@ class TestBuildConfiguration(unittest.TestCase):
         classifiers = project.get("classifiers", [])
         self.assertFalse([c for c in classifiers if c.startswith("License ::")], "classifier di licenza deprecato")
 
-    def test_runtime_dependencies_are_only_requests_and_bs4(self) -> None:
+    def test_runtime_dependencies_are_only_requests(self) -> None:
         names = {re.split(r"[<>=!~ ]", d)[0] for d in pyproject()["project"]["dependencies"]}
-        self.assertEqual(names, {"requests", "beautifulsoup4"})
+        self.assertEqual(names, {"requests"})
 
     def test_ruff_is_configured(self) -> None:
         ruff = pyproject()["tool"]["ruff"]

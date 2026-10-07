@@ -1,6 +1,6 @@
 # Maintainer: ani-it contributors <info@ani-it.org>
 pkgname=ani-it
-pkgver=1.0.0   # deve coincidere con ani_it/_version.py (verificato da tests/test_packaging.py)
+pkgver=2.0.0   # deve coincidere con ani_it/_version.py (verificato da tests/test_packaging.py)
 pkgrel=1
 pkgdesc="CLI interattiva in stile ani-cli per lo streaming di anime da AnimeUnity in italiano"
 arch=('any')
@@ -9,7 +9,6 @@ license=('GPL-3.0-or-later')
 depends=(
     'python'
     'python-requests'
-    'python-beautifulsoup4'
     'fzf'
     'mpv'
     'yt-dlp'

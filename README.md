@@ -1,6 +1,6 @@
 # ani-it 🌸
 > **Client CLI/TUI nativo per lo streaming e il download di Anime da AnimeUnity in italiano.**
-> Ottimizzato per **Arch Linux**, **Wayland** (Hyprland, Sway), **X11** e **PipeWire**.
+> Hardened, ultraleggero (<30 MB RAM) e multipiattaforma (**Linux**, **macOS**, **Windows**).
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Arch Linux](https://img.shields.io/badge/Arch_Linux-Ready-1793d1?logo=arch-linux&logoColor=white)](#-installazione-su-arch-linux)
@@ -8,22 +8,16 @@
 
 ---
 
-## 🌟 Caratteristiche Principali
+## 🌟 Caratteristiche Principali (v2.0)
 
-- **Nativo per Arch Linux**: Progettato per integrarsi con l'ecosistema moderno di Arch (Wayland, PipeWire, socket IPC Unix).
-- **Interfaccia TUI**: Selezione interattiva tramite `fzf` con colorazione ANSI, Nerd Fonts v3.x e anteprime dinamiche.
-- **Anteprime locandine**: Se `chafa` è installato, la locandina viene mostrata nel pannello di anteprima di `fzf` con caratteri Unicode (`--symbols=vhalf,braille`). Non c'è supporto ai protocolli grafici Kitty/Sixel.
-- **Player MPV con socket IPC**: Controllo di `mpv` tramite JSON-IPC, rilevamento della fine episodio (evento `end-file`), **ripresa dalla posizione** in cui avevi interrotto (salvata in cronologia) e avanzamento automatico (`auto_next`).
-- **Qualità video**: `-q 720` sceglie la variante HLS giusta del master (`--hls-bitrate` per mpv, filtro d'altezza di `yt-dlp` per i download), senza mai sostituire il master con una singola variante: così non si perdono le tracce audio.
-- **Download**: `yt-dlp` per i flussi HLS e `aria2c` per i file diretti, con gli argomenti di `aria2c` configurabili. Intervalli di episodi (`1-12`, `1,3,5`, `all`), anche con episodi decimali (`12.5`), episodio `0` e numerazioni che non partono da 1. I download interrotti si riprendono dal punto raggiunto.
-- **Conformità XDG**:
-  - Configurazione: `$XDG_CONFIG_HOME/ani-it/config.toml` (o `~/.config/ani-it/config.toml`)
-  - Cronologia atomica: `$XDG_STATE_HOME/ani-it/history.json` (o `~/.local/state/ani-it/history.json`)
-  - Cache: `$XDG_CACHE_HOME/ani-it/` (o `~/.cache/ani-it/`)
-  - Socket runtime: `$XDG_RUNTIME_DIR/ani-it/` (o una directory privata `0700` in `/tmp/ani-it-$UID/`, verificata prima dell'uso)
-- **Shell completions** per **Fish**, **Bash** e **Zsh** (i titoli in cronologia sono completati in modo sicuro).
-- **Scraper e resolver resilienti**: parser dedicato per gli embed Vixcloud, deoffuscamento di script JS packed (Dean Edwards) e retry esponenziale **solo** sugli errori transitori (rete, 429, 403 e 5xx): un 404 non viene ritentato e viene distinto da "sito irraggiungibile".
-- **Connessioni sicure**: la verifica dei certificati TLS è sempre attiva e non c'è nessun downgrade automatico a HTTP.
+- **Hardened & Sicuro**: Prevenzione totale di command/argument injection (nessun `shell=True`), sanitizzazione rigorosa dei file e nomi directory, validazione rigida degli URL e protocolli.
+- **Zero-Overhead Scraping**: BeautifulSoup4 completamente rimosso in favore di regex compilate statiche ad alte prestazioni e decoding JSON diretto; consumo di memoria ridotto sotto i 30 MB di baseline RSS.
+- **Multipiattaforma Nativo**: Supporto completo per **Linux** (qualsiasi distro/XDG), **macOS** (Application Support/Caches) e **Windows 10/11** (Named Pipes IPC, ANSI processing abilitato).
+- **Interfaccia TUI**: Selezione interattiva tramite `fzf` con colorazione ANSI (palette Tokyo Night), Nerd Fonts v3.x e anteprime locandine con chafa (con cache LRU su disco fino a 15 elementi).
+- **Player MPV con socket IPC**: Controllo di `mpv` tramite JSON-IPC (socket Unix o Named Pipe su Windows), rilevamento fine episodio (`end-file`), ripresa automatica della posizione salvata e buffer di rete hard-capped per prevenire memory leak.
+- **Qualità video e Streaming**: Selezione automatica o manuale della qualità (`1080p`, `720p`, `480p`, `best`), fallback controllato a porta 80 per CDN statici privi di listener SSL.
+- **Download Resiliente**: Download chunked a blocchi da 64 KB (senza buffering cumulativo in RAM), `--disk-cache=16M` con `aria2c` e `yt-dlp`. Intervalli di episodi flessibili (`1-12`, `1,3,5`, `all`) e ripresa automatica dei download interrotti.
+- **Shell Completions** per **Fish**, **Bash** e **Zsh**.
 
 ---
 
@@ -31,13 +25,13 @@
 
 ### Pacchetti Obbligatori (Arch Linux)
 ```bash
-sudo pacman -S python python-requests python-beautifulsoup4 fzf mpv yt-dlp
+sudo pacman -S python python-requests fzf mpv yt-dlp
 ```
 `fzf` e il player configurato (`player.binary`, di default `mpv`) sono indispensabili: senza, il programma si ferma con un messaggio. `yt-dlp` serve per i download e per gli episodi HLS scaricati: se manca, viene mostrato un avviso e lo streaming continua a funzionare.
 
 ### Pacchetti Opzionali Consigliati
-- `aria2`: per saturare la banda durante il download multi-connessione.
-- `chafa`: per le locandine nella finestra di anteprima di `fzf`.
+- `aria2`: per accelerare i download con connessioni segmentate multi-thread.
+- `chafa`: per le locandine grafiche nella finestra di anteprima di `fzf`.
 
 ```bash
 sudo pacman -S aria2 chafa
@@ -56,7 +50,7 @@ cd ani-it
 makepkg -si
 ```
 
-> Il rilascio deve avere il tag corrispondente (`git tag v1.0.0 && git push --tags`): il `PKGBUILD` lo usa come sorgente riproducibile.
+> Il rilascio deve avere il tag corrispondente (`git tag v2.0.0 && git push --tags`): il `PKGBUILD` lo usa come sorgente riproducibile.
 
 ### Metodo 2: Installazione locale con Pip / Virtualenv
 ```bash
@@ -214,7 +208,7 @@ rm -rf ~/.cache/ani-it
 ## 🧪 Sviluppo
 
 ```bash
-# Test (solo libreria standard + requests/bs4; i test shell si saltano se mancano bash-completion, fish o zsh)
+# Test (solo libreria standard + requests; i test shell si saltano se mancano bash-completion, fish o zsh)
 python -m unittest discover -s tests
 
 # Lint

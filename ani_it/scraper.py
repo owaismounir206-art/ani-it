@@ -1,4 +1,4 @@
-"""Scraper avanzato e resiliente per AnimeUnity con supporto API LiveSearch, Archivio e info_api."""
+"""Scraper ad alte prestazioni per AnimeUnity (Zero-Overhead, nessun BeautifulSoup, solo Regex + JSON)."""
 
 import html
 import json
@@ -9,9 +9,27 @@ from typing import Any, Optional
 from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
 
-from ani_it.constants import DEFAULT_BASE_URL, DEFAULT_USER_AGENT, Endpoints, site_headers
+from ani_it.constants import (
+    DEFAULT_BASE_URL,
+    DEFAULT_USER_AGENT,
+    HTTP_TIMEOUT,
+    RE_ANIME,
+    RE_ANIMES,
+    RE_COVER_IMG,
+    RE_COVER_IMG_ALT,
+    RE_CSRF,
+    RE_EPISODE,
+    RE_EPISODES,
+    RE_GENRES,
+    RE_H1_TITLE,
+    RE_PLOT,
+    RE_SCORE,
+    RE_SCRIPT_EPISODES,
+    RE_TITLE_TAG,
+    Endpoints,
+    site_headers,
+)
 from ani_it.utils import normalize_episode_number
 
 logger = logging.getLogger("ani_it.scraper")
@@ -22,26 +40,18 @@ class EpisodesNotFoundError(Exception):
 
 
 class SiteUnreachableError(requests.exceptions.ConnectionError):
-    """AnimeUnity non è raggiungibile (rete, timeout) o risponde con errori persistenti (403/429/5xx).
-
-    Estende ConnectionError per restare compatibile con chi già la intercetta.
-    """
+    """AnimeUnity non è raggiungibile (rete, timeout) o risponde con errori persistenti (403/429/5xx)."""
 
 
 class ResourceNotFoundError(Exception):
     """AnimeUnity è raggiungibile ma la risorsa richiesta non esiste (HTTP 404/410)."""
 
 
-# Stati HTTP transitori: ha senso ritentare. Gli altri 4xx (404, 422, ...) non cambiano ritentando.
 RETRYABLE_STATUS = frozenset({403, 429})
 
 
 def title_from_slug(slug: str) -> str:
-    """Titolo leggibile ricavato dallo slug, con il suffisso di lingua come tag (ITA / SUB ITA).
-
-    Il suffisso si riconosce sui token interi dello slug: '-ita' dentro un'altra parola
-    (es. 'hospitalita') non è un tag, e i tag restano in maiuscolo.
-    """
+    """Titolo leggibile ricavato dallo slug, con il suffisso di lingua come tag (ITA / SUB ITA)."""
     tokens = [t for t in slug.split("-") if t]
     tag = ""
     if len(tokens) > 2 and tokens[-2:] == ["sub", "ita"]:
@@ -52,14 +62,12 @@ def title_from_slug(slug: str) -> str:
 
 
 class AnimeUnityScraper:
-    """Gestisce le comunicazioni HTTP verso AnimeUnity, con gestione sessione, CSRF token, retry e parsing multi-livello."""
+    """Gestisce le comunicazioni HTTP verso AnimeUnity senza sovraccarico di DOM."""
 
     def __init__(self, session: Optional[requests.Session] = None, base_url: str = DEFAULT_BASE_URL) -> None:
         self.base_url = base_url.rstrip("/")
         self.endpoints = Endpoints(self.base_url)
         self.session = session or requests.Session()
-        # La sessione è condivisa col resolver (Vixcloud, CDN): gli header specifici di
-        # AnimeUnity (Origin, Sec-Fetch-*, CSRF, XHR) vanno solo nelle richieste al sito.
         self.session.headers.setdefault("User-Agent", DEFAULT_USER_AGENT)
         self.max_retries = 3
         self.base_backoff = 1.0
@@ -67,7 +75,7 @@ class AnimeUnityScraper:
         self._csrf_expires: float = 0.0
 
     def _site_headers(self, api: bool = False, extra: Optional[dict[str, str]] = None) -> dict[str, str]:
-        """Header per le richieste ad AnimeUnity. Quelli AJAX/CSRF solo per le chiamate API."""
+        """Header per le richieste ad AnimeUnity."""
         headers = site_headers(self.base_url)
         if api:
             headers.update({
@@ -83,7 +91,7 @@ class AnimeUnityScraper:
         return headers
 
     def _ensure_session(self) -> None:
-        """Recupera il token CSRF necessario per le chiamate API interne (senza toccare la sessione)."""
+        """Recupera il token CSRF necessario per le chiamate API interne."""
         if self._csrf_token and time.time() < self._csrf_expires:
             return
 
@@ -91,17 +99,15 @@ class AnimeUnityScraper:
             resp = self.session.get(
                 self.base_url,
                 headers=self._site_headers(),
-                timeout=10,
+                timeout=HTTP_TIMEOUT,
                 allow_redirects=True,
             )
-            html_text = resp.text
-            match = re.search(r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']', html_text, re.I)
-            if not match:
-                match = re.search(r'<meta\s+content=["\']([^"\']+)["\']\s+name=["\']csrf-token["\']', html_text, re.I)
-
+            match = RE_CSRF.search(resp.text)
             if match:
-                self._csrf_token = match.group(1).strip()
-                self._csrf_expires = time.time() + 300
+                token = match.group(1) or match.group(2)
+                if token:
+                    self._csrf_token = token.strip()
+                    self._csrf_expires = time.time() + 300
         except Exception as exc:
             logger.debug("Impossibile recuperare il token CSRF da AnimeUnity: %s", exc)
 
@@ -114,16 +120,7 @@ class AnimeUnityScraper:
         headers: Optional[dict[str, str]] = None,
         api: bool = False,
     ) -> requests.Response:
-        """Invia una richiesta HTTP (GET o POST) ritentando solo gli errori transitori.
-
-        Ritenta con backoff esponenziale errori di rete/timeout, HTTP 429, 403 (spesso
-        Cloudflare) e 5xx. Non stampa nulla: l'errore finale viene sollevato al chiamante.
-
-        Raises:
-            ResourceNotFoundError: HTTP 404/410, la risorsa non esiste.
-            requests.exceptions.HTTPError: altri errori 4xx, che ritentare non risolve.
-            SiteUnreachableError: sito irraggiungibile o errori transitori persistenti.
-        """
+        """Invia una richiesta HTTP (GET o POST) con retry controllato ed esponenziale."""
         req_headers = self._site_headers(api=api, extra=headers)
         last_error: Optional[Exception] = None
         last_status: Optional[int] = None
@@ -136,7 +133,7 @@ class AnimeUnityScraper:
                         params=params,
                         json=json_data,
                         headers=req_headers,
-                        timeout=12,
+                        timeout=HTTP_TIMEOUT,
                         allow_redirects=True,
                     )
                 else:
@@ -144,7 +141,7 @@ class AnimeUnityScraper:
                         url,
                         params=params,
                         headers=req_headers,
-                        timeout=12,
+                        timeout=HTTP_TIMEOUT,
                         allow_redirects=True,
                     )
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
@@ -168,7 +165,7 @@ class AnimeUnityScraper:
         raise SiteUnreachableError(f"Impossibile connettersi ad AnimeUnity ({url}): {last_error}") from last_error
 
     def search_anime(self, query: str) -> list[dict[str, Any]]:
-        """Cerca anime su AnimeUnity per titolo interrogando livesearch, archivio API e fallback HTML."""
+        """Cerca anime su AnimeUnity interrogando get-animes, livesearch e fallback HTML/Vue."""
         clean_query = query.strip()
         if not clean_query:
             return []
@@ -184,9 +181,7 @@ class AnimeUnityScraper:
             "Origin": self.base_url,
         }
 
-        # ----------------------------------------------------------------------
-        # STRATEGIA 1: POST /archivio/get-animes (API interna del catalogo)
-        # ----------------------------------------------------------------------
+        # 1. STRATEGIA 1: POST /archivio/get-animes
         try:
             payload = {
                 "title": clean_query,
@@ -199,7 +194,9 @@ class AnimeUnityScraper:
                 "offset": 0,
                 "dubbed": False,
             }
-            resp = self._request_with_retry("POST", self.endpoints.get_animes, json_data=payload, headers=api_headers, api=True)
+            resp = self._request_with_retry(
+                "POST", self.endpoints.get_animes, json_data=payload, headers=api_headers, api=True
+            )
             data = resp.json()
             records = data.get("records") if isinstance(data, dict) else (data if isinstance(data, list) else [])
             if isinstance(records, list):
@@ -215,12 +212,12 @@ class AnimeUnityScraper:
         except Exception as exc:
             logger.debug("Tentativo get-animes fallito: %s", exc)
 
-        # ----------------------------------------------------------------------
-        # STRATEGIA 2: POST /livesearch (Ricerca istantanea di AnimeUnity)
-        # ----------------------------------------------------------------------
+        # 2. STRATEGIA 2: POST /livesearch
         try:
             live_payload = {"title": clean_query}
-            resp = self._request_with_retry("POST", self.endpoints.livesearch, json_data=live_payload, headers=api_headers, api=True)
+            resp = self._request_with_retry(
+                "POST", self.endpoints.livesearch, json_data=live_payload, headers=api_headers, api=True
+            )
             live_data = resp.json()
             live_records = live_data.get("records") if isinstance(live_data, dict) else (live_data if isinstance(live_data, list) else [])
             if isinstance(live_records, list):
@@ -236,9 +233,7 @@ class AnimeUnityScraper:
         except Exception as exc:
             logger.debug("Tentativo livesearch fallito: %s", exc)
 
-        # ----------------------------------------------------------------------
-        # STRATEGIA 3: Fallback GET /archivio HTML con estrazione Vue / DOM
-        # ----------------------------------------------------------------------
+        # 3. STRATEGIA 3: Fallback GET /archivio HTML con estrazione Vue diretta (no BeautifulSoup)
         if not results:
             try:
                 resp = self._request_with_retry("GET", self.endpoints.archive, params={"title": clean_query})
@@ -252,8 +247,7 @@ class AnimeUnityScraper:
                             results.append(norm)
 
                 if not results:
-                    soup = BeautifulSoup(html_text, "html.parser")
-                    dom_items = self._parse_dom_anime_items(soup)
+                    dom_items = self._parse_regex_anime_items(html_text)
                     for item in dom_items:
                         if item["id"] and item["id"] not in seen_ids:
                             seen_ids.add(item["id"])
@@ -270,7 +264,7 @@ class AnimeUnityScraper:
         return results
 
     def get_anime_details(self, anime_id: str | int, slug: str) -> dict[str, Any]:
-        """Recupera la scheda completa dell'anime con episodi da info_api e markup HTML."""
+        """Recupera la scheda dell'anime ed episodi da info_api e markup HTML leggero."""
         clean_slug = str(slug).strip()
         str_id = str(anime_id).strip()
 
@@ -284,20 +278,14 @@ class AnimeUnityScraper:
 
         episodes: list[dict[str, Any]] = []
         seen_ep_numbers: set[Any] = set()
-        # Ultimo errore reale (rete/parsing) per fonte: serve a non confondere un
-        # guasto con una serie senza episodi.
         api_error: Optional[Exception] = None
         html_error: Optional[Exception] = None
         api_chunks_loaded = 0
 
-        # ----------------------------------------------------------------------
-        # 1. Recupero episodi da info_api/{anime_id}/1 (API interna di AnimeUnity)
-        # In AnimeUnity le richieste sono suddivise in blocchi di 120 episodi:
-        # start_range=1&end_range=120, poi 121-240, ecc.
-        # ----------------------------------------------------------------------
+        # 1. Recupero episodi da info_api/{anime_id}/1 in blocchi da 120
         start_range = 1
         chunk_size = 120
-        max_chunks = 15  # Fino a 1800 episodi (copre One Piece, Detective Conan, ecc.)
+        max_chunks = 15
 
         for _ in range(max_chunks):
             end_range = start_range + chunk_size - 1
@@ -318,7 +306,6 @@ class AnimeUnityScraper:
                     episodes.append(episode)
 
                 api_chunks_loaded += 1
-                # Se il blocco conteneva meno di chunk_size episodi, abbiamo finito
                 if len(raw_eps) < chunk_size:
                     break
                 start_range += chunk_size
@@ -327,9 +314,7 @@ class AnimeUnityScraper:
                 api_error = exc
                 break
 
-        # ----------------------------------------------------------------------
-        # 2. Parsing pagina HTML per metadati completi (titolo, trama, voto, locandina)
-        # ----------------------------------------------------------------------
+        # 2. Parsing rapido con Regex per metadati della pagina HTML
         plot = ""
         title = target_slug
         image_url = ""
@@ -339,74 +324,80 @@ class AnimeUnityScraper:
         try:
             page_resp = self._request_with_retry("GET", url)
             html_text = page_resp.text
-            soup = BeautifulSoup(html_text, "html.parser")
 
-            # Titolo
-            title_tag = soup.find("h1") or soup.find("title")
-            if title_tag:
-                title = title_tag.get_text(strip=True)
+            # Titolo da <h1> o <title>
+            h1_match = RE_H1_TITLE.search(html_text)
+            if h1_match:
+                raw_t = re.sub(r"<[^>]+>", "", h1_match.group(1))
+                title = html.unescape(raw_t).strip()
                 title = re.sub(r"\s*-\s*AnimeUnity.*$", "", title, flags=re.IGNORECASE).strip()
+            else:
+                title_match = RE_TITLE_TAG.search(html_text)
+                if title_match:
+                    raw_t = re.sub(r"<[^>]+>", "", title_match.group(1))
+                    title = html.unescape(raw_t).strip()
+                    title = re.sub(r"\s*-\s*AnimeUnity.*$", "", title, flags=re.IGNORECASE).strip()
 
-            # Trama
-            plot_tag = soup.find("p", class_=re.compile(r"plot|description|trama", re.I))
-            if plot_tag:
-                plot = plot_tag.get_text(strip=True)
+            # Trama da <p class="...plot...">
+            plot_match = RE_PLOT.search(html_text)
+            if plot_match:
+                raw_p = re.sub(r"<[^>]+>", "", plot_match.group(1))
+                plot = html.unescape(raw_p).strip()
 
-            # Immagine di copertina
-            img_tag = soup.find("img", class_=re.compile(r"poster|cover|anime-image", re.I))
-            if img_tag and img_tag.get("src"):
-                image_url = urljoin(self.base_url, str(img_tag["src"]))
+            # Copertina da <img class="...poster...">
+            img_match = RE_COVER_IMG.search(html_text) or RE_COVER_IMG_ALT.search(html_text)
+            if img_match:
+                src = img_match.group(1).strip()
+                image_url = urljoin(self.base_url, src)
 
             # Valutazione
-            score_tag = soup.find(class_=re.compile(r"score|rating|vote", re.I))
-            if score_tag:
-                score = score_tag.get_text(strip=True)
+            score_match = RE_SCORE.search(html_text)
+            if score_match:
+                score = html.unescape(score_match.group(1)).strip()
 
             # Generi
-            genre_tags = soup.find_all("a", href=re.compile(r"/archivio\?.*genre", re.I))
-            for g in genre_tags:
-                g_text = g.get_text(strip=True).rstrip(",")
-                if g_text and g_text not in genres:
-                    genres.append(g_text)
+            for g_raw in RE_GENRES.findall(html_text):
+                g_clean = html.unescape(g_raw).strip().rstrip(",")
+                if g_clean and g_clean not in genres:
+                    genres.append(g_clean)
 
-            # ------------------------------------------------------------------
-            # 3. Fallback estrazione episodi dall'HTML se info_api era vuota
-            # ------------------------------------------------------------------
+            # 3. Fallback estrazione episodi dall'HTML se info_api non ha risposto
             if not episodes:
-                player_tag = soup.find("video-player")
                 raw_episodes = None
-                if player_tag:
-                    # 1. Attributo :episodes
-                    ep_attr = player_tag.get(":episodes") or player_tag.get("episodes") or player_tag.get("v-bind:episodes")
-                    if ep_attr:
+
+                # Estrazione diretta con regex su Vue attributes
+                m_eps = RE_EPISODES.search(html_text)
+                if m_eps:
+                    try:
+                        raw_episodes = json.loads(html.unescape(m_eps.group(1)))
+                    except Exception:
+                        pass
+
+                if not raw_episodes:
+                    m_anime = RE_ANIME.search(html_text)
+                    if m_anime:
                         try:
-                            raw_episodes = json.loads(ep_attr)
+                            a_obj = json.loads(html.unescape(m_anime.group(1)))
+                            if isinstance(a_obj, dict):
+                                raw_episodes = a_obj.get("episodes")
                         except Exception:
                             pass
 
-                    # 2. Attributo :anime
-                    if not raw_episodes:
-                        anime_attr = player_tag.get(":anime") or player_tag.get("anime") or player_tag.get("v-bind:anime")
-                        if anime_attr:
-                            try:
-                                anime_obj = json.loads(anime_attr)
-                                if isinstance(anime_obj, dict):
-                                    raw_episodes = anime_obj.get("episodes")
-                            except Exception:
-                                pass
-
-                    # 3. Attributo :episode (singolo per film/OAV)
-                    if not raw_episodes:
-                        single_ep = player_tag.get(":episode")
-                        if single_ep:
-                            try:
-                                raw_episodes = [json.loads(single_ep)]
-                            except Exception:
-                                pass
-
-                # 4. Fallback tramite regex script
                 if not raw_episodes:
-                    raw_episodes = self._extract_episodes_from_scripts(html_text)
+                    m_ep = RE_EPISODE.search(html_text)
+                    if m_ep:
+                        try:
+                            raw_episodes = [json.loads(html.unescape(m_ep.group(1)))]
+                        except Exception:
+                            pass
+
+                if not raw_episodes:
+                    m_script = RE_SCRIPT_EPISODES.search(html_text)
+                    if m_script:
+                        try:
+                            raw_episodes = json.loads(m_script.group(1))
+                        except Exception:
+                            pass
 
                 if isinstance(raw_episodes, list):
                     for raw_ep in raw_episodes:
@@ -420,18 +411,14 @@ class AnimeUnityScraper:
             logger.debug("Errore durante il parsing HTML della scheda anime: %s", exc)
             html_error = exc
 
-        # ----------------------------------------------------------------------
-        # 4. Nessun episodio trovato: niente episodi inventati. L'ID dell'anime non è
-        # un ID episodio (partirebbe il video sbagliato) e un episodio finto nasconderebbe
-        # gli errori di rete. Se c'è stato un errore reale lo si propaga così com'è.
-        # ----------------------------------------------------------------------
+        # 4. Validazione finale episodi
         if not episodes:
             failure = html_error or api_error
             if failure is not None:
                 raise failure
             raise EpisodesNotFoundError(f"Nessun episodio disponibile per '{title}' (id {str_id}).")
 
-        # Ordina episodi per numero crescente
+        # Ordina episodi
         def get_sort_key(item: dict[str, Any]) -> float:
             try:
                 return float(item.get("number", 0))
@@ -439,9 +426,6 @@ class AnimeUnityScraper:
                 return 0.0
 
         episodes.sort(key=get_sort_key)
-
-        # Un errore dopo aver già caricato almeno un blocco da info_api significa che la
-        # lista è troncata: va segnalato, non presentato come completa.
         partial = api_error is not None and api_chunks_loaded > 0
 
         return {
@@ -458,16 +442,8 @@ class AnimeUnityScraper:
             "partial_reason": str(api_error) if partial else "",
         }
 
-    # ==========================================================================
-    # METODI DI SUPPORTO PER IL PARSING
-    # ==========================================================================
-
     def _build_episode(self, raw: Any) -> Optional[dict[str, Any]]:
-        """Normalizza un episodio grezzo (da info_api o dall'HTML) nella struttura interna.
-
-        Restituisce None se `raw` non è un dizionario. Il numero 0 è valido: si ricorre
-        all'ID solo se il numero manca (`is None`), mai per valori "falsy".
-        """
+        """Normalizza un episodio grezzo nella struttura dati standard di ani-it."""
         if not isinstance(raw, dict):
             return None
 
@@ -481,7 +457,6 @@ class AnimeUnityScraper:
         raw_link = str(raw.get("link") or raw.get("scws_id") or raw.get("file_name") or "").strip()
         dead_hosts = ("animeunityserver", "animessvserver")
 
-        # Se il link non è un URL HTTP valido o punta a CDN deprecate con SSL rotto, usa l'endpoint embed-url
         if (not raw_link.startswith("http") or any(d in raw_link for d in dead_hosts)) and raw.get("id"):
             link = f"{self.endpoints.embed_url}/{raw['id']}"
         else:
@@ -519,50 +494,29 @@ class AnimeUnityScraper:
                         continue
         return None
 
-    def _extract_episodes_from_scripts(self, html_text: str) -> Optional[list[dict[str, Any]]]:
-        """Estrae l'array degli episodi cercando variabili inline nei tag script."""
-        patterns = [
-            r"var\s+episodes\s*=\s*(\[.*?\]);",
-            r"let\s+episodes\s*=\s*(\[.*?\]);",
-            r'"episodes"\s*:\s*(\[\{.*?\}\])',
-            r"episodes\s*:\s*(\[\{.*?\}\])",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, html_text, re.DOTALL)
-            if match:
-                try:
-                    data = json.loads(match.group(1))
-                    if isinstance(data, list):
-                        return data
-                except Exception:
-                    continue
-        return None
-
-    def _parse_dom_anime_items(self, soup: BeautifulSoup) -> list[dict[str, Any]]:
-        """Estrae informazioni navigando i tag DOM nel caso di fallback server-side."""
+    def _parse_regex_anime_items(self, html_text: str) -> list[dict[str, Any]]:
+        """Fallback leggero via Regex per estrarre schede anime dai link nell'HTML."""
         results: list[dict[str, Any]] = []
-        anime_links = soup.find_all("a", href=re.compile(r"/anime/(\d+)-?([\w-]+)?"))
+        link_pattern = re.compile(r'<a[^>]+href=["\'](?:https?://[^/]+)?/anime/(\d+)(?:-([\w-]+))?["\'][^>]*>(.*?)</a>', re.DOTALL | re.IGNORECASE)
         seen_ids: set[str] = set()
 
-        for a in anime_links:
-            href = str(a.get("href", ""))
-            match = re.search(r"/anime/(\d+)(?:-([\w-]+))?", href)
-            if not match:
-                continue
-
+        for match in link_pattern.finditer(html_text):
             anime_id = match.group(1)
             slug = match.group(2) or anime_id
+            inner_html = match.group(3)
+
             if anime_id in seen_ids:
                 continue
             seen_ids.add(anime_id)
 
-            title = a.get_text(strip=True)
-            img = a.find("img")
+            title = re.sub(r"<[^>]+>", "", inner_html).strip()
+            img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', inner_html, re.I)
             img_url = ""
-            if img:
-                img_url = urljoin(self.base_url, str(img.get("src") or img.get("data-src") or ""))
-                if not title and img.get("alt"):
-                    title = str(img.get("alt")).strip()
+            if img_match:
+                img_url = urljoin(self.base_url, img_match.group(1).strip())
+                alt_match = re.search(r'<img[^>]+alt=["\']([^"\']+)["\']', inner_html, re.I)
+                if not title and alt_match:
+                    title = alt_match.group(1).strip()
 
             if not title:
                 title = slug.replace("-", " ").title()
@@ -586,26 +540,19 @@ class AnimeUnityScraper:
         return results
 
     def _normalize_anime_entry(self, raw: dict[str, Any]) -> dict[str, Any]:
-        """Uniforma la struttura dati di un anime restituita dalle API di AnimeUnity.
-        Risolve accuratamente i titoli in italiano, inglese o slug per evitare voci 'Senza Titolo'.
-        """
+        """Uniforma la struttura dati di un anime restituita da AnimeUnity."""
         anime_id = str(raw.get("id") or raw.get("anime_id") or "")
         slug = str(raw.get("slug") or raw.get("name_slug") or anime_id)
 
-        # Ricerca robusta del titolo attraverso tutti i possibili campi
         name_it = str(raw.get("title_it") or "").strip()
         name_eng = str(raw.get("title_eng") or "").strip()
         name_orig = str(raw.get("title_original") or "").strip()
         name_main = str(raw.get("title") or raw.get("name") or "").strip()
 
-        # Genera un fallback leggibile basato sullo slug
         clean_slug_name = title_from_slug(slug)
-
-        # Selezione gerarchica del titolo per non avere mai "Senza Titolo"
         title = name_it or name_eng or name_main or name_orig or clean_slug_name or f"Anime {anime_id}"
         title_eng = name_eng or name_orig or (name_it if name_it != title else "")
 
-        # L'API di AnimeUnity usa `imageurl` (verificato dal vivo); `cover` è sempre null
         image_url = raw.get("imageurl") or raw.get("image_url") or raw.get("image") or raw.get("cover") or ""
         if image_url and not image_url.startswith(("http://", "https://")):
             image_url = urljoin(self.base_url, image_url)

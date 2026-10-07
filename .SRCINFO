@@ -1,6 +1,6 @@
 pkgbase = ani-it
 	pkgdesc = CLI interattiva in stile ani-cli per lo streaming di anime da AnimeUnity in italiano
-	pkgver = 1.0.0
+	pkgver = 2.0.0
 	pkgrel = 1
 	url = https://github.com/owaismounir206-art/ani-it
 	arch = any
@@ -12,13 +12,12 @@ pkgbase = ani-it
 	makedepends = python-setuptools
 	depends = python
 	depends = python-requests
-	depends = python-beautifulsoup4
 	depends = fzf
 	depends = mpv
 	depends = yt-dlp
 	optdepends = aria2: per accelerare i download con connessioni multiple segmentate
 	optdepends = chafa: per visualizzare le anteprime delle locandine nella TUI
-	source = ani-it::git+https://github.com/owaismounir206-art/ani-it.git#tag=v1.0.0
+	source = ani-it::git+https://github.com/owaismounir206-art/ani-it.git#tag=v2.0.0
 	sha256sums = SKIP
 
 pkgname = ani-it

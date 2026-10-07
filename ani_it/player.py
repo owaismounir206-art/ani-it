@@ -1,22 +1,26 @@
-"""Controller per il video player mpv con supporto IPC Unix socket, PipeWire e Wayland."""
+"""Controller per il video player mpv con supporto IPC cross-platform (Unix Socket e Windows Named Pipe) v2.0."""
 
+import gc
 import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from ani_it.config import Config
-from ani_it.constants import SOCKET_NAME_TEMPLATE
+from ani_it.constants import PIPE_NAME_TEMPLATE, SOCKET_NAME_TEMPLATE
 from ani_it.utils import (
     SignalHandler,
     detect_display_server,
     get_runtime_dir,
+    is_windows,
 )
 
 
@@ -35,44 +39,51 @@ LOG_TAIL_LINES = 10
 
 
 class MpvIpcClient:
-    """Client minimale per il protocollo JSON-IPC di mpv su socket Unix.
+    """Client per il protocollo JSON-IPC di mpv compatibile con Unix Socket e Windows Named Pipe."""
 
-    mpv scrive sullo stesso socket sia le risposte ai comandi sia eventi asincroni
-    (una riga JSON ciascuno). Ogni comando porta un `request_id` e il client legge per
-    righe complete, scartando eventi e risposte che non corrispondono al comando atteso.
-    """
-
-    def __init__(self, socket_path: Path) -> None:
-        self.socket_path = socket_path
+    def __init__(self, target: Union[Path, str]) -> None:
+        self.target = target
         self._sock: Optional[socket.socket] = None
+        self._pipe: Optional[Any] = None
         self._buffer = b""
         self._next_request_id = 1
-        # Ultimi eventi asincroni ricevuti (end-file, ecc.), consultabili dal chiamante
         self.events: deque[dict[str, Any]] = deque(maxlen=100)
 
     @property
     def connected(self) -> bool:
-        return self._sock is not None
+        return self._sock is not None or self._pipe is not None
 
     def try_connect(self) -> bool:
-        """Un solo tentativo di connessione al socket di mpv, senza attese."""
-        if self._sock is not None:
+        """Un solo tentativo non bloccante di connessione al canale IPC di mpv."""
+        if self.connected:
             return True
-        if not self.socket_path.exists():
-            return False
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            sock.settimeout(1.0)
-            sock.connect(str(self.socket_path))
-        except OSError:
-            sock.close()
-            return False
-        self._sock = sock
-        self._buffer = b""
-        return True
+
+        if is_windows():
+            pipe_str = str(self.target)
+            try:
+                # Apertura Named Pipe Win32 in modalità binaria senza buffer
+                self._pipe = open(pipe_str, "r+b", buffering=0)
+                self._buffer = b""
+                return True
+            except OSError:
+                return False
+        else:
+            socket_path = Path(self.target)
+            if not socket_path.exists():
+                return False
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(1.0)
+                sock.connect(str(socket_path))
+            except OSError:
+                sock.close()
+                return False
+            self._sock = sock
+            self._buffer = b""
+            return True
 
     def connect(self, timeout: float = 5.0) -> bool:
-        """Tenta la connessione al socket Unix di mpv con polling fino a timeout."""
+        """Tenta la connessione con polling fino a timeout."""
         start_time = time.time()
         while time.time() - start_time < timeout:
             if self.try_connect():
@@ -81,12 +92,9 @@ class MpvIpcClient:
         return False
 
     def pump(self, timeout: float) -> None:
-        """Legge i messaggi per al più `timeout` secondi accumulando gli eventi di mpv.
-
-        Ritorna prima se mpv chiude il socket (cioè esce). Le risposte a comandi vengono scartate.
-        """
+        """Legge i messaggi per al più `timeout` secondi accumulando gli eventi di mpv."""
         deadline = time.monotonic() + timeout
-        while self._sock is not None:
+        while self.connected:
             message = self._read_message(deadline)
             if message is None:
                 return
@@ -98,93 +106,121 @@ class MpvIpcClient:
         while True:
             if b"\n" in self._buffer:
                 line, self._buffer = self._buffer.split(b"\n", 1)
-                if not line.strip():
+                line = line.strip()
+                if not line:
                     continue
                 try:
-                    message = json.loads(line)
-                except ValueError:
-                    continue  # riga corrotta: scartata
-                if isinstance(message, dict):
-                    return message
-                continue
+                    return json.loads(line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
 
-            if self._sock is None:
-                return None
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None
+
             try:
-                self._sock.settimeout(remaining)
-                chunk = self._sock.recv(4096)
-            except TimeoutError:
+                if self._sock is not None:
+                    self._sock.settimeout(max(0.05, remaining))
+                    chunk = self._sock.recv(4096)
+                    if not chunk:
+                        self.close()
+                        return None
+                    self._buffer += chunk
+                elif self._pipe is not None:
+                    # Lettura Named Pipe Windows
+                    chunk = self._pipe.read(4096)
+                    if not chunk:
+                        self.close()
+                        return None
+                    self._buffer += chunk
+                else:
+                    return None
+            except (socket.timeout, BlockingIOError):
                 return None
             except OSError:
                 self.close()
                 return None
-            if not chunk:  # mpv ha chiuso il socket
-                self.close()
-                return None
-            self._buffer += chunk
 
-    def send_command(self, command: list[Any], timeout: float = 2.0) -> Optional[Any]:
-        """Invia un comando a mpv e restituisce il campo 'data' della *sua* risposta.
-
-        Eventi asincroni e risposte con un `request_id` diverso (comandi scaduti) vengono
-        scartati. Restituisce None su errore di mpv, timeout o connessione persa.
-        """
-        if not self._sock:
+    def send_command(self, command: list[Any], timeout: float = 1.0) -> Optional[dict[str, Any]]:
+        """Invia un comando con request_id e attende la risposta corrispondente."""
+        if not self.connected:
             return None
 
-        request_id = self._next_request_id
+        req_id = self._next_request_id
         self._next_request_id += 1
-        payload = json.dumps({"command": command, "request_id": request_id}) + "\n"
+        payload = json.dumps({"command": command, "request_id": req_id}) + "\n"
+
         try:
-            self._sock.sendall(payload.encode("utf-8"))
+            raw_payload = payload.encode("utf-8")
+            if self._sock is not None:
+                self._sock.sendall(raw_payload)
+            elif self._pipe is not None:
+                self._pipe.write(raw_payload)
         except OSError:
             self.close()
             return None
 
         deadline = time.monotonic() + timeout
-        while True:
+        while self.connected:
             message = self._read_message(deadline)
             if message is None:
                 return None
+            if message.get("request_id") == req_id:
+                return message
             if "event" in message:
                 self.events.append(message)
-                continue
-            if message.get("request_id") != request_id:
-                continue
-            if message.get("error", "success") != "success":
-                return None
-            return message.get("data")
 
-    def get_property(self, prop_name: str) -> Optional[Any]:
-        """Recupera il valore di una proprietà da mpv."""
-        return self.send_command(["get_property", prop_name])
+        return None
+
+    def get_property(self, name: str, timeout: float = 1.0) -> Any:
+        """Legge una proprietà di mpv; None su errore o timeout."""
+        reply = self.send_command(["get_property", name], timeout=timeout)
+        if reply and reply.get("error") == "success":
+            return reply.get("data")
+        return None
 
     def close(self) -> None:
-        """Chiude il socket Unix."""
-        if self._sock:
+        """Chiude la connessione socket o pipe."""
+        if self._sock is not None:
             try:
                 self._sock.close()
-            except Exception:
+            except OSError:
                 pass
             self._sock = None
 
+        if self._pipe is not None:
+            try:
+                self._pipe.close()
+            except OSError:
+                pass
+            self._pipe = None
+
 
 class MpvController:
-    """Gestisce l'invocazione di mpv, gli argomenti di sistema Arch e il monitoraggio IPC."""
+    """Gestisce il ciclo di vita, il comando e il monitoraggio del player video mpv."""
 
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.runtime_dir = get_runtime_dir()
-        self.socket_path = self.runtime_dir / SOCKET_NAME_TEMPLATE.format(pid=os.getpid())
+        self._init_ipc_target()
+
+    def _init_ipc_target(self) -> None:
+        """Inizializza il target IPC (Named Pipe per Windows, Unix Socket per Unix)."""
+        if is_windows():
+            pipe_id = uuid.uuid4().hex[:12]
+            self.ipc_target_str = PIPE_NAME_TEMPLATE.format(uuid=pipe_id)
+            self.socket_path = Path(self.ipc_target_str)
+        else:
+            self.runtime_dir = get_runtime_dir()
+            socket_name = SOCKET_NAME_TEMPLATE.format(pid=os.getpid())
+            self.socket_path = self.runtime_dir / socket_name
+            self.ipc_target_str = str(self.socket_path)
 
     def _cleanup_socket(self) -> None:
-        """Rimuove il file del socket Unix se rimasto aperto."""
-        if self.socket_path.exists():
+        """Rimuove il file del socket Unix se ancora presente (su Windows le Named Pipe si distruggono da sole)."""
+        if not is_windows():
             try:
-                self.socket_path.unlink()
+                if self.socket_path.exists():
+                    self.socket_path.unlink()
             except OSError:
                 pass
 
@@ -196,13 +232,13 @@ class MpvController:
         start_time: Optional[float] = None,
         quit_on_eof: bool = False,
     ) -> PlaybackResult:
-        """Avvia mpv con monitoraggio IPC (vedi `_play`), registrando la pulizia del socket
-        solo per la durata della riproduzione: le callback non si accumulano tra un episodio e l'altro."""
+        """Esegue mpv registrando la pulizia del socket/pipe in caso di segnale."""
         SignalHandler.register_cleanup(self._cleanup_socket)
         try:
             return self._play(stream_data, anime_title, episode_number, start_time, quit_on_eof)
         finally:
             SignalHandler.unregister_cleanup(self._cleanup_socket)
+            gc.collect()
 
     def _play(
         self,
@@ -212,19 +248,7 @@ class MpvController:
         start_time: Optional[float] = None,
         quit_on_eof: bool = False,
     ) -> PlaybackResult:
-        """Avvia mpv con accelerazione hardware, PipeWire e monitoraggio IPC.
-
-        Args:
-            stream_data: Dizionario contenente 'stream_url' e 'headers'.
-            anime_title: Titolo della serie per la barra del titolo.
-            episode_number: Numero dell'episodio.
-            start_time: Posizione di partenza opzionale in secondi.
-            quit_on_eof: Chiude mpv appena l'episodio finisce (necessario per l'avanzamento
-                automatico quando mpv.conf imposta keep-open e mpv resterebbe aperto).
-
-        Returns:
-            PlaybackResult con lo stato dell'uscita e il progresso raggiunto.
-        """
+        """Avvia mpv con hard-cap di memoria RAM e monitoraggio IPC."""
         self._cleanup_socket()
 
         stream_url = stream_data["stream_url"]
@@ -232,20 +256,21 @@ class MpvController:
 
         title_str = f"ani-it | {anime_title} - Ep. {episode_number}"
 
-        # Output video/audio: si lascia scegliere a mpv (mpv.conf dell'utente incluso). Solo in una
-        # TTY pura, dove il valore predefinito non funziona, serve un'uscita video esplicita.
         vo_args = ["--vo=drm,caca"] if detect_display_server() == "tty" else []
 
         cmd = [
             self.config.player.binary,
             stream_url,
             f"--title={title_str}",
-            f"--input-ipc-server={self.socket_path}",
+            f"--input-ipc-server={self.ipc_target_str}",
+            # Hard-cap della memoria demuxing e cache per impedire il consumo di RAM
+            "--demuxer-max-bytes=64M",
+            "--demuxer-max-back-bytes=16M",
+            "--cache=yes",
+            "--cache-secs=30",
         ]
 
-        # Intestazioni HTTP. User-Agent e Referer hanno opzioni dedicate: in
-        # --http-header-fields (lista separata da virgole) lo User-Agent verrebbe spezzato
-        # a "(KHTML, like Gecko)". Gli altri header sono accodati uno per volta.
+        # Intestazioni HTTP
         user_agent = referer = None
         extra_headers: list[str] = []
         for name, value in headers.items():
@@ -263,12 +288,11 @@ class MpvController:
             cmd.append(f"--referrer={referer}")
         cmd.extend(f"--http-header-fields-append={header}" for header in extra_headers)
 
-        # Variante HLS scelta dal resolver per la qualità richiesta (il master resta intatto)
         hls_bitrate = stream_data.get("hls_bitrate")
         if hls_bitrate:
             cmd.append(f"--hls-bitrate={int(hls_bitrate)}")
 
-        # Rileva se è richiesto il rendering del video direttamente nel terminale
+        # Rileva se è richiesta la riproduzione video all'interno del terminale
         is_terminal_vo = any(
             any(vo in arg for vo in ("--vo=tct", "--vo=kitty", "--vo=sixel", "--vo=caca"))
             for arg in (*vo_args, *self.config.player.args)
@@ -278,16 +302,12 @@ class MpvController:
 
         cmd += [
             *window_args,
-            # mpv non verifica i certificati TLS di default: come per aria2c e yt-dlp, va chiesto
             "--tls-verify=yes",
-            # Solo gli errori nel log (mpv li scrive su stdout): niente riga di stato
-            # continua, così il file di log resta piccolo.
             "--msg-level=all=error",
             *vo_args,
             *self.config.player.args,
         ]
 
-        # Sottotitoli se disponibili
         for sub in stream_data.get("subtitles", []):
             cmd.append(f"--sub-file={sub['url']}")
 
@@ -295,7 +315,7 @@ class MpvController:
             cmd.append(f"--start={int(start_time)}")
 
         if is_terminal_vo:
-            # Per il video nel terminale, stdout/stdin non devono essere rediretti a file temporanei
+            # Per il video nel terminale, stdout/stdin non devono essere rediretti a file
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -306,18 +326,18 @@ class MpvController:
             except FileNotFoundError:
                 raise FileNotFoundError(
                     f"Il lettore video '{self.config.player.binary}' non è installato sul sistema.\n"
-                    "Installalo con: sudo pacman -S mpv"
+                    "Installalo con il package manager di sistema (es. pacman -S mpv o brew install mpv)."
                 ) from None
 
             SignalHandler.register_process(proc)
-
-            ipc = MpvIpcClient(self.socket_path)
+            ipc = MpvIpcClient(self.ipc_target_str)
             try:
                 last_pos, duration, percent, eof_reached = self._monitor(proc, ipc, quit_on_eof)
             finally:
                 SignalHandler.unregister_process(proc)
                 ipc.close()
                 self._cleanup_socket()
+                gc.collect()
 
             return PlaybackResult(
                 status=self._classify_exit(proc.returncode, eof_reached, percent),
@@ -327,8 +347,6 @@ class MpvController:
                 error_output="",
             )
 
-        # L'output di mpv va in un file temporaneo (non in una pipe, che bloccherebbe mpv
-        # se piena): serve a mostrare all'utente il motivo di un errore di riproduzione.
         with tempfile.TemporaryFile() as mpv_log:
             try:
                 proc = subprocess.Popen(
@@ -339,43 +357,47 @@ class MpvController:
             except FileNotFoundError:
                 raise FileNotFoundError(
                     f"Il lettore video '{self.config.player.binary}' non è installato sul sistema.\n"
-                    "Installalo con: sudo pacman -S mpv"
+                    "Installalo con il package manager di sistema (es. pacman -S mpv o brew install mpv)."
                 ) from None
 
             SignalHandler.register_process(proc)
-
-            ipc = MpvIpcClient(self.socket_path)
+            ipc = MpvIpcClient(self.ipc_target_str)
             try:
                 last_pos, duration, percent, eof_reached = self._monitor(proc, ipc, quit_on_eof)
             finally:
                 SignalHandler.unregister_process(proc)
                 ipc.close()
                 self._cleanup_socket()
+                gc.collect()
 
-            error_output = self._read_log_tail(mpv_log)
+            error_tail = ""
+            if proc.returncode != 0:
+                try:
+                    mpv_log.seek(0)
+                    raw_lines = mpv_log.readlines()
+                    tail = [line.decode("utf-8", errors="replace") for line in raw_lines[-LOG_TAIL_LINES:]]
+                    error_tail = "".join(tail).strip()
+                except OSError:
+                    pass
 
-        return PlaybackResult(
-            status=self._classify_exit(proc.returncode, eof_reached, percent),
-            time_pos=last_pos,
-            duration=duration,
-            percent_pos=percent,
-            error_output=error_output,
-        )
+            return PlaybackResult(
+                status=self._classify_exit(proc.returncode, eof_reached, percent),
+                time_pos=last_pos,
+                duration=duration,
+                percent_pos=percent,
+                error_output=error_tail,
+            )
 
-    @staticmethod
     def _monitor(
-        proc: "subprocess.Popen[bytes]",
+        self,
+        proc: subprocess.Popen[bytes],
         ipc: MpvIpcClient,
         quit_on_eof: bool,
     ) -> tuple[float, float, float, bool]:
-        """Segue mpv finché è in esecuzione: posizione, durata e fine episodio.
-
-        La connessione IPC viene ritentata a ogni ciclo (il socket può comparire dopo
-        qualche secondo). La fine episodio si riconosce sia dalla proprietà `eof-reached`
-        (con keep-open) sia dall'evento `end-file` con reason "eof" (senza keep-open mpv
-        esce subito e la proprietà non è più leggibile).
-        """
-        last_pos = duration = percent = 0.0
+        """Segue il processo fino all'uscita interrogando mpv tramite IPC."""
+        last_pos = 0.0
+        duration = 0.0
+        percent = 0.0
         eof_reached = False
         quit_sent = False
 
@@ -409,7 +431,7 @@ class MpvController:
             except (TypeError, ValueError):
                 pass
 
-            ipc.pump(0.5)  # attende gli eventi (al posto di un sleep) e li accumula
+            ipc.pump(0.5)
             if absorb_events():
                 eof_reached = True
 
@@ -417,36 +439,17 @@ class MpvController:
                 ipc.send_command(["quit"], timeout=1.0)
                 quit_sent = True
 
-        # mpv è uscito: gli ultimi eventi (end-file) possono essere ancora nel buffer del socket
         if ipc.connected:
             ipc.pump(0.2)
-        if absorb_events():
-            eof_reached = True
+            if absorb_events():
+                eof_reached = True
 
         return last_pos, duration, percent, eof_reached
 
-    @staticmethod
-    def _classify_exit(retcode: Optional[int], eof_reached: bool, percent: float) -> str:
-        """Determina lo stato di visione dall'uscita di mpv.
-
-        Codici di uscita di mpv: 0 = uscita normale (anche con 'q'), 1 = errore di
-        inizializzazione, 2 = file non riproducibile, 3 = alcuni file non riproducibili,
-        4 = interrotto da un segnale. Solo 0 è un'uscita volontaria.
-        """
-        # Considerato completato se EOF raggiunto o se l'utente ha visto almeno il 90%
-        if eof_reached or percent >= 90.0:
+    def _classify_exit(self, retcode: int, eof_reached: bool, percent_pos: float) -> str:
+        """Deduce se l'uscita è stata un completamento, un quit manuale o un errore."""
+        if eof_reached or percent_pos >= 90.0:
             return "completed"
-        if retcode == 0 or retcode is None:
+        if retcode == 0:
             return "quit"
         return "error"
-
-    @staticmethod
-    def _read_log_tail(mpv_log: Any) -> str:
-        """Restituisce le ultime righe non vuote scritte da mpv nel file di log."""
-        try:
-            mpv_log.seek(0)
-            text = mpv_log.read().decode("utf-8", errors="replace")
-        except (OSError, ValueError):
-            return ""
-        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-        return "\n".join(lines[-LOG_TAIL_LINES:])

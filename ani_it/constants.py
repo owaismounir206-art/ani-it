@@ -1,5 +1,6 @@
-"""Costanti globali, endpoint di AnimeUnity, template e codici ANSI per ani-it."""
+"""Costanti globali, endpoint di AnimeUnity, template, regex compilate e codici ANSI per ani-it v2.0."""
 
+import re
 from dataclasses import dataclass
 from typing import Final
 
@@ -13,6 +14,9 @@ APP_VERSION: Final[str] = __version__
 # `general.base_url` in config.toml, e gli endpoint si derivano con Endpoints(base_url).
 DEFAULT_BASE_URL: Final[str] = "https://www.animeunity.so"
 BASE_URL: Final[str] = DEFAULT_BASE_URL
+
+# Timeout HTTP rigidi: (connessione 3.5s, lettura 15s)
+HTTP_TIMEOUT: Final[tuple[float, float]] = (3.5, 15.0)
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,7 @@ DEFAULT_USER_AGENT: Final[str] = (
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
+
 def site_headers(base_url: str = DEFAULT_BASE_URL) -> dict[str, str]:
     """Header di navigazione per le richieste verso AnimeUnity (Referer/Origin dal dominio base)."""
     return {
@@ -76,6 +81,58 @@ def site_headers(base_url: str = DEFAULT_BASE_URL) -> dict[str, str]:
 
 
 DEFAULT_HEADERS: Final[dict[str, str]] = site_headers(DEFAULT_BASE_URL)
+
+
+# ==============================================================================
+# REGEX COMPILATE STATICHE AD ALTE PRESTAZIONI (ZERO-OVERHEAD SCRAPING)
+# ==============================================================================
+
+RE_ANIMES: Final[re.Pattern[str]] = re.compile(
+    r':animes=["\'](\[\{.*?\}\])["\']', re.DOTALL
+)
+RE_EPISODES: Final[re.Pattern[str]] = re.compile(
+    r':episodes=["\'](\[\{.*?\}\])["\']', re.DOTALL
+)
+RE_ANIME: Final[re.Pattern[str]] = re.compile(
+    r':anime=["\'](\{.*?\})["\']', re.DOTALL
+)
+RE_EPISODE: Final[re.Pattern[str]] = re.compile(
+    r':episode=["\'](\{.*?\})["\']', re.DOTALL
+)
+
+RE_CSRF: Final[re.Pattern[str]] = re.compile(
+    r'<meta\s+name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']|'
+    r'<meta\s+content=["\']([^"\']+)["\']\s+name=["\']csrf-token["\']',
+    re.IGNORECASE,
+)
+
+RE_H1_TITLE: Final[re.Pattern[str]] = re.compile(r'<h1[^>]*>(.*?)</h1>', re.IGNORECASE | re.DOTALL)
+RE_TITLE_TAG: Final[re.Pattern[str]] = re.compile(r'<title[^>]*>(.*?)</title>', re.IGNORECASE | re.DOTALL)
+RE_PLOT: Final[re.Pattern[str]] = re.compile(
+    r'<p[^>]*class=["\'][^"\']*(?:plot|description|trama)[^"\']*["\'][^>]*>(.*?)</p>',
+    re.IGNORECASE | re.DOTALL,
+)
+RE_COVER_IMG: Final[re.Pattern[str]] = re.compile(
+    r'<img[^>]*class=["\'][^"\']*(?:poster|cover|anime-image)[^"\']*["\'][^>]*src=["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
+RE_COVER_IMG_ALT: Final[re.Pattern[str]] = re.compile(
+    r'<img[^>]*src=["\']([^"\']+)["\'][^>]*class=["\'][^"\']*(?:poster|cover|anime-image)[^"\']*["\']',
+    re.IGNORECASE,
+)
+RE_SCORE: Final[re.Pattern[str]] = re.compile(
+    r'class=["\'][^"\']*(?:score|rating|vote)[^"\']*["\'][^>]*>([^<]+)<',
+    re.IGNORECASE,
+)
+RE_GENRES: Final[re.Pattern[str]] = re.compile(
+    r'<a[^>]*href=["\'][^"\']*/archivio\?[^"\']*genre[^"\']*["\'][^>]*>([^<]+)</a>',
+    re.IGNORECASE,
+)
+RE_SCRIPT_EPISODES: Final[re.Pattern[str]] = re.compile(
+    r'(?:var|let)?\s*episodes\s*[:=]\s*(\[\{.*?\}\])',
+    re.DOTALL,
+)
+
 
 # Codici Colori ANSI ed Escape Sequences
 class Colors:
@@ -151,8 +208,9 @@ class Icons:
     ROCKET: Final[str] = "󰛡"       # nf-md-rocket
 
 
-# Nome del socket IPC di mpv: include il PID così più istanze non si cancellano il socket a vicenda
+# Nome del socket IPC di mpv
 SOCKET_NAME_TEMPLATE: Final[str] = "ani-it-mpv-{pid}.sock"
+PIPE_NAME_TEMPLATE: Final[str] = r"\\.\pipe\ani-it-mpv-{uuid}"
 
 # Formati stream riconosciuti
 FORMAT_HLS: Final[str] = "hls"
@@ -160,3 +218,12 @@ FORMAT_MP4: Final[str] = "mp4"
 
 # Risoluzioni supportate
 RESOLUTIONS: Final[tuple[str, ...]] = ("1080p", "720p", "480p", "best")
+
+# Stati formali della macchina a stati della TUI
+STATE_SEARCHING: Final[str] = "SEARCHING"
+STATE_ANIME_SELECT: Final[str] = "ANIME_SELECT"
+STATE_EPISODE_SELECT: Final[str] = "EPISODE_SELECT"
+STATE_PLAYING: Final[str] = "PLAYING"
+STATE_POST_WATCH: Final[str] = "POST_WATCH"
+STATE_DOWNLOADING: Final[str] = "DOWNLOADING"
+STATE_IDLE: Final[str] = "IDLE"
