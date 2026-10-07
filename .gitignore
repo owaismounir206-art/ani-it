@@ -13,6 +13,7 @@ dist/
 # Arch Linux packaging
 pkg/
 src/
+/ani-it/
 *.pkg.tar.*
 *.pkg.tar.zst
 
