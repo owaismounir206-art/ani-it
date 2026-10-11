@@ -199,5 +199,63 @@ class TestDownloadDir(unittest.TestCase):
             self.assertEqual(list(Path(home).iterdir()), [])
 
 
+class TestTerminalVoDetectionAndFlags(unittest.TestCase):
+    """Rilevamento automatico e flag ad alta risoluzione per il video nel terminale."""
+
+    def test_detects_kitty_and_ghostty_and_wezterm(self) -> None:
+        from ani_it.utils import detect_terminal_vo
+
+        self.assertEqual(detect_terminal_vo(env={"KITTY_WINDOW_ID": "1"}, walk_parents=False), "kitty")
+        self.assertEqual(detect_terminal_vo(env={"TERM": "xterm-kitty"}, walk_parents=False), "kitty")
+        self.assertEqual(detect_terminal_vo(env={"GHOSTTY_RESOURCES_DIR": "/usr/share/ghostty"}, walk_parents=False), "kitty")
+        self.assertEqual(detect_terminal_vo(env={"TERM_PROGRAM": "WezTerm"}, walk_parents=False), "kitty")
+        self.assertEqual(detect_terminal_vo(env={"KONSOLE_VERSION": "240800"}, walk_parents=False), "kitty")
+
+    def test_detects_sixel_terminals_like_foot(self) -> None:
+        from ani_it.utils import detect_terminal_vo
+
+        self.assertEqual(detect_terminal_vo(env={"TERM": "foot"}, walk_parents=False), "sixel")
+        self.assertEqual(detect_terminal_vo(env={"TERM": "foot-extra"}, walk_parents=False), "sixel")
+        self.assertEqual(detect_terminal_vo(env={"TERM_PROGRAM": "contour"}, walk_parents=False), "sixel")
+        self.assertEqual(detect_terminal_vo(env={"WT_SESSION": "uuid-123"}, walk_parents=False), "sixel")
+
+    def test_falls_back_to_tct_for_generic_terminals(self) -> None:
+        from ani_it.utils import detect_terminal_vo
+
+        self.assertEqual(detect_terminal_vo(env={"TERM": "xterm-256color"}, walk_parents=False), "tct")
+        self.assertEqual(detect_terminal_vo(env={}, walk_parents=False), "tct")
+
+    def test_kitty_flags_prevent_320x240_fallback_when_pixels_missing(self) -> None:
+        from ani_it.utils import build_terminal_vo_args
+
+        args = build_terminal_vo_args(
+            "kitty",
+            env={"KITTY_WINDOW_ID": "1", "TERM": "xterm-kitty"},
+            walk_parents=False,
+            geometry=(160, 45, 0, 0),
+        )
+        self.assertIn("--vo=kitty", args)
+        self.assertIn("--vo-kitty-use-shm=yes", args)
+        self.assertIn("--sws-scaler=lanczos", args)
+        self.assertIn("--vo-kitty-width=1920", args)
+        self.assertIn("--vo-kitty-height=1080", args)
+
+    def test_sixel_flags_enable_dynamic_palette_and_hd_dimensions(self) -> None:
+        from ani_it.utils import build_terminal_vo_args
+
+        args = build_terminal_vo_args(
+            "sixel",
+            env={"TERM": "foot"},
+            walk_parents=False,
+            geometry=(140, 40, 0, 0),
+        )
+        self.assertIn("--vo=sixel", args)
+        self.assertIn("--vo-sixel-fixedpalette=no", args)
+        self.assertIn("--vo-sixel-reqcolors=256", args)
+        self.assertIn("--vo-sixel-buffered=yes", args)
+        self.assertIn("--vo-sixel-width=1680", args)
+        self.assertIn("--vo-sixel-height=960", args)
+
+
 if __name__ == "__main__":
     unittest.main()

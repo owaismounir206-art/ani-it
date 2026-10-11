@@ -97,7 +97,18 @@ def render_preview(anime_id: str, preview_art: bool = True, cache_dir: Optional[
             _prune_cover_cache(covers_dir, max_items=MAX_COVERS_LRU)
             try:
                 subprocess.run(
-                    ["chafa", "--size=36x20", "--clear", "--symbols=vhalf,braille", str(cover_path)],
+                    [
+                        "chafa",
+                        "--format=symbols",
+                        "--probe=off",
+                        "--size=40x22",
+                        "--clear",
+                        "--colors=full",
+                        "--color-space=din99d",
+                        "--work=9",
+                        "--symbols=block+border+space+sextant+quad+vhalf+braille",
+                        str(cover_path),
+                    ],
                     check=False,
                 )
             except Exception:

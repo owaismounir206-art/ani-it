@@ -506,15 +506,30 @@ class TestDownloadMode(CliHarness):
 class TestTerminalVoWiring(CliHarness):
     def test_default_terminal_flag_injects_tct_and_force_window_no(self) -> None:
         config = Config()
-        self.run_main(argv=["ani-it", "serie", "-t"], config=config)
+        with patch("ani_it.utils.detect_terminal_vo", return_value="tct"):
+            self.run_main(argv=["ani-it", "serie", "-t"], config=config)
         self.assertIn("--vo=tct", config.player.args)
         self.assertIn("--force-window=no", config.player.args)
+        self.assertIn("--sws-scaler=lanczos", config.player.args)
+        self.assertIn("--vo-tct-algo=half-blocks", config.player.args)
+        self.assertIn("--vo-tct-buffering=frame", config.player.args)
+
+    def test_auto_terminal_flag_detects_foot_sixel_high_res(self) -> None:
+        config = Config()
+        with patch("ani_it.utils.detect_terminal_vo", return_value="sixel"):
+            self.run_main(argv=["ani-it", "serie", "-t"], config=config)
+        self.assertIn("--vo=sixel", config.player.args)
+        self.assertIn("--force-window=no", config.player.args)
+        self.assertIn("--vo-sixel-fixedpalette=no", config.player.args)
+        self.assertIn("--vo-sixel-reqcolors=256", config.player.args)
+        self.assertIn("--sws-scaler=lanczos", config.player.args)
 
     def test_custom_terminal_driver_kitty(self) -> None:
         config = Config()
         self.run_main(argv=["ani-it", "serie", "--terminal=kitty"], config=config)
         self.assertIn("--vo=kitty", config.player.args)
         self.assertIn("--force-window=no", config.player.args)
+        self.assertIn("--sws-scaler=lanczos", config.player.args)
 
 
 if __name__ == "__main__":

@@ -130,11 +130,12 @@ ani-it -d -e 1-12 "Frieren"
 # Forza una risoluzione specifica (es. 720p, 1080p, best)
 ani-it -q 720 "Attack on Titan"
 
-# Riproduzione video direttamente nel terminale (senza finestra grafica esterna)
-ani-it -t "Steins;Gate"         # Driver predefinito 'tct' (True Color Terminal, blocchi Unicode RGB)
-ani-it -t kitty "Cyberpunk"     # Grafica pixel Kitty (per Kitty, Ghostty, WezTerm)
-ani-it -t sixel "Bocchi"        # Grafica Sixel (per Foot, WezTerm)
-ani-it -t caca "Evangelion"     # Modalità ASCII color art
+# Riproduzione video in alta risoluzione direttamente nel terminale (senza finestra grafica esterna)
+ani-it -t "Steins;Gate"         # Rilevamento automatico HD ('kitty' su Kitty/Ghostty/WezTerm, 'sixel' su Foot, fallback 'tct')
+ani-it -t kitty "Cyberpunk"     # Grafica pixel HD 24-bit Kitty con Shared Memory (per Kitty, Ghostty, WezTerm, Konsole)
+ani-it -t sixel "Bocchi"        # Grafica pixel HD Sixel con palette dinamica (per Foot, WezTerm, XTerm)
+ani-it -t tct "Evangelion"      # Semiblocchi Unicode TrueColor RGB (universale)
+ani-it -t caca "Lain"           # Modalità ASCII color art
 
 # Pulizia dei dati
 ani-it --clear-history   # Azzera la cronologia

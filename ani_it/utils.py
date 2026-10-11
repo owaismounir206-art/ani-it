@@ -77,6 +77,198 @@ def enable_windows_ansi() -> bool:
         return False
 
 
+_KITTY_PROCESS_NAMES: Final[frozenset[str]] = frozenset({
+    "kitty", "ghostty", "wezterm-gui", "wezterm", "konsole", "rio",
+})
+_SIXEL_PROCESS_NAMES: Final[frozenset[str]] = frozenset({
+    "foot", "footclient", "mlterm", "contour", "blackbox", "xterm", "yaft",
+})
+
+
+def _detect_terminal_from_ancestors() -> Optional[str]:
+    """Risale l'albero dei processi su Linux (/proc) per identificare l'emulatore di terminale."""
+    if not is_linux():
+        return None
+    pid = os.getpid()
+    for _ in range(10):
+        if pid <= 1:
+            break
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="ignore").strip().lower()
+            if comm in _KITTY_PROCESS_NAMES:
+                return "kitty"
+            if comm in _SIXEL_PROCESS_NAMES:
+                return "sixel"
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="ignore")
+            rparen = stat_text.rfind(")")
+            if rparen == -1:
+                break
+            fields = stat_text[rparen + 2 :].split()
+            pid = int(fields[1]) if len(fields) > 1 else 0
+        except (OSError, ValueError, IndexError):
+            break
+    return None
+
+
+def detect_terminal_vo(
+    env: Optional[dict[str, str]] = None,
+    walk_parents: bool = True,
+) -> str:
+    """Rileva automaticamente il driver grafico da terminale a più alta risoluzione supportato.
+
+    Ordine di priorità:
+    1. 'kitty'  (Grafica pixel HD a 24-bit per Kitty, Ghostty, WezTerm, Konsole, Rio, Warp)
+    2. 'sixel'  (Grafica pixel HD Sixel per Foot, XTerm, mlterm, Contour, BlackBox, Windows Terminal)
+    3. 'tct'    (Fallback universale TrueColor con semiblocchi Unicode)
+    """
+    environ = env if env is not None else os.environ
+    term = (environ.get("TERM") or "").lower()
+    term_program = (environ.get("TERM_PROGRAM") or "").lower()
+
+    # 1. Rilevamento protocollo grafico Kitty (massima risoluzione e velocità)
+    if (
+        environ.get("KITTY_WINDOW_ID")
+        or environ.get("KITTY_PID")
+        or environ.get("GHOSTTY_RESOURCES_DIR")
+        or environ.get("GHOSTTY_BIN_DIR")
+        or environ.get("WEZTERM_PANE")
+        or environ.get("WEZTERM_EXECUTABLE")
+        or environ.get("KONSOLE_VERSION")
+        or environ.get("KONSOLE_DBUS_SERVICE")
+        or any(k in term for k in ("kitty", "ghostty", "wezterm"))
+        or term_program in ("kitty", "ghostty", "wezterm", "konsole", "rio", "warp")
+    ):
+        return "kitty"
+
+    # 2. Rilevamento protocollo grafico Sixel (Foot su Wayland, XTerm, Windows Terminal, ecc.)
+    if (
+        any(s in term for s in ("foot", "sixel", "mlterm", "yaft"))
+        or term_program in ("foot", "mlterm", "contour", "blackbox", "mintty", "iterm.app")
+        or environ.get("WT_SESSION")
+        or environ.get("XTERM_VERSION")
+    ):
+        return "sixel"
+
+    # 3. Se dentro una subshell/multiplexer su Linux, ispeziona il processo padre dell'emulatore
+    if walk_parents and env is None:
+        ancestor_vo = _detect_terminal_from_ancestors()
+        if ancestor_vo:
+            return ancestor_vo
+
+    return "tct"
+
+
+def get_terminal_size_pixels() -> tuple[int, int, int, int]:
+    """Restituisce (colonne, righe, larghezza_pixel, altezza_pixel) del terminale corrente."""
+    cols, rows, xpixel, ypixel = 0, 0, 0, 0
+    if not is_windows():
+        try:
+            import fcntl
+            import struct
+            import termios
+
+            for stream in (sys.stdout, sys.stdin, sys.stderr):
+                try:
+                    fd = stream.fileno()
+                    data = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8)
+                    r, c, xp, yp = struct.unpack("HHHH", data)
+                    if c > 0 and r > 0:
+                        cols, rows = c, r
+                        if xp > 0 and yp > 0:
+                            xpixel, ypixel = xp, yp
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    if cols <= 0 or rows <= 0:
+        fallback = shutil.get_terminal_size((120, 35))
+        cols = fallback.columns or 120
+        rows = fallback.lines or 35
+
+    return cols, rows, xpixel, ypixel
+
+
+def build_terminal_vo_args(
+    vo_driver: str = "auto",
+    env: Optional[dict[str, str]] = None,
+    walk_parents: bool = True,
+    geometry: Optional[tuple[int, int, int, int]] = None,
+) -> list[str]:
+    """Costruisce i flag mpv ottimizzati per massimizzare risoluzione e nitidezza nel terminale."""
+    environ = env if env is not None else os.environ
+    resolved = detect_terminal_vo(env=env, walk_parents=walk_parents) if vo_driver == "auto" else vo_driver
+    cols, rows, xpixel, ypixel = geometry if geometry is not None else get_terminal_size_pixels()
+
+    args: list[str] = [
+        f"--vo={resolved}",
+        "--force-window=no",
+        "--really-quiet",
+        "--sws-scaler=lanczos",
+        "--sws-fast=no",
+    ]
+
+    if resolved == "kitty":
+        is_remote = bool(environ.get("SSH_CONNECTION") or environ.get("SSH_TTY"))
+        in_mux = bool(environ.get("TMUX") or environ.get("STY"))
+        if in_mux:
+            args.append("--vo-kitty-auto-multiplexer-passthrough=yes")
+        elif not is_windows() and not is_remote:
+            # Shared Memory POSIX: trasferimento frame 1080p zero-copy ad altissima velocità
+            term_str = (environ.get("TERM") or "").lower()
+            if (
+                environ.get("KITTY_WINDOW_ID")
+                or environ.get("KITTY_PID")
+                or environ.get("GHOSTTY_RESOURCES_DIR")
+                or "kitty" in term_str
+                or "ghostty" in term_str
+            ):
+                args.append("--vo-kitty-use-shm=yes")
+
+        # Evita il fallback di mpv a 320x240 quando TIOCGWINSZ non riporta le dimensioni in pixel
+        if xpixel <= 0 or ypixel <= 0:
+            width = max(1280, cols * 12)
+            height = max(720, rows * 24)
+            args.extend([
+                f"--vo-kitty-cols={cols}",
+                f"--vo-kitty-rows={rows}",
+                f"--vo-kitty-width={width}",
+                f"--vo-kitty-height={height}",
+            ])
+
+    elif resolved == "sixel":
+        # Palette dinamica a 256 colori per ogni frame (elimina il dithering granuloso XTERM256)
+        args.extend([
+            "--vo-sixel-buffered=yes",
+            "--vo-sixel-fixedpalette=no",
+            "--vo-sixel-reqcolors=256",
+            "--vo-sixel-dither=auto",
+        ])
+        # Evita il fallback di mpv a 320x240 quando TIOCGWINSZ non riporta le dimensioni in pixel
+        if xpixel <= 0 or ypixel <= 0:
+            width = max(1280, cols * 12)
+            height = max(720, rows * 24)
+            args.extend([
+                f"--vo-sixel-cols={cols}",
+                f"--vo-sixel-rows={rows}",
+                f"--vo-sixel-width={width}",
+                f"--vo-sixel-height={height}",
+            ])
+
+    elif resolved == "tct":
+        # Semiblocchi Unicode 24-bit TrueColor con buffering a frame intero e dimensioni reali
+        args.extend([
+            "--vo-tct-algo=half-blocks",
+            "--vo-tct-buffering=frame",
+            "--vo-tct-256=no",
+            f"--vo-tct-width={cols}",
+            f"--vo-tct-height={rows}",
+        ])
+
+    return args
+
+
 # ==============================================================================
 # GESTIONE PERCORSI FILESYSTEM CROSS-PLATFORM
 # ==============================================================================

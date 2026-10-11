@@ -24,6 +24,7 @@ from ani_it.scraper import AnimeUnityScraper, EpisodesNotFoundError
 from ani_it.ui import FzfUI
 from ani_it.utils import (
     SignalHandler,
+    build_terminal_vo_args,
     enable_windows_ansi,
     format_duration,
     get_cache_dir,
@@ -103,10 +104,10 @@ def create_parser() -> argparse.ArgumentParser:
         "--terminal",
         dest="terminal_vo",
         nargs="?",
-        const="tct",
-        choices=["tct", "kitty", "sixel", "caca"],
+        const="auto",
+        choices=["auto", "kitty", "sixel", "tct", "caca"],
         default=None,
-        help="Riproduci il video direttamente nel terminale ('tct', 'kitty', 'sixel', 'caca').",
+        help="Riproduci il video in alta risoluzione nel terminale ('auto', 'kitty', 'sixel', 'tct', 'caca').",
     )
 
     parser.add_argument(
@@ -432,9 +433,9 @@ def main() -> None:
         q_val = args.quality if (args.quality.endswith("p") or args.quality == "best") else f"{args.quality}p"
         config.general.quality = q_val
 
-    # Sovrascrittura output video da terminale (-t / --terminal)
+    # Sovrascrittura output video da terminale ad alta risoluzione (-t / --terminal)
     if args.terminal_vo:
-        config.player.args = [f"--vo={args.terminal_vo}", "--force-window=no"] + config.player.args
+        config.player.args = build_terminal_vo_args(args.terminal_vo) + config.player.args
 
     # Banner introduttivo moderno
     ui.print_banner()

@@ -13,7 +13,7 @@ _ani_it_completions() {
             return 0
             ;;
         -t|--terminal)
-            COMPREPLY=( $(compgen -W "tct kitty sixel caca" -- "${cur}") )
+            COMPREPLY=( $(compgen -W "auto kitty sixel tct caca" -- "${cur}") )
             return 0
             ;;
         -e|--episode)
