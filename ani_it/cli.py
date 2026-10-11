@@ -33,101 +33,193 @@ from ani_it.utils import (
 
 
 def create_parser() -> argparse.ArgumentParser:
-    """Crea il parser degli argomenti CLI con tutti i flag supportati."""
+    """Crea il parser degli argomenti CLI con guida dettagliata, sezioni ed esempi pratici."""
+    description = (
+        f"{Colors.BRIGHT_CYAN}╭─────────────────────────────────────────────────────────────────────────╮\n"
+        f"│  {Colors.BOLD}{Colors.BRIGHT_MAGENTA}🌸 {APP_NAME} v{APP_VERSION}{Colors.RESET}"
+        f"{Colors.BRIGHT_CYAN}  •  {Colors.BOLD}{Colors.BRIGHT_WHITE}Streaming & Download Anime da AnimeUnity (CLI/TUI){Colors.RESET}"
+        f"{Colors.BRIGHT_CYAN}  │\n"
+        f"╰─────────────────────────────────────────────────────────────────────────╯{Colors.RESET}\n"
+        f"Client interattivo ultraleggero basato su {Colors.BOLD}fzf{Colors.RESET}, {Colors.BOLD}mpv{Colors.RESET}, "
+        f"{Colors.BOLD}chafa{Colors.RESET} e {Colors.BOLD}aria2c{Colors.RESET}/{Colors.BOLD}yt-dlp{Colors.RESET}."
+    )
+
+    epilog = (
+        f"{Colors.BOLD}{Colors.BRIGHT_CYAN}ESEMPI DI UTILIZZO PER OGNI COMANDO:{Colors.RESET}\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it{Colors.RESET}                             "
+        f"Avvia il prompt di ricerca interattivo con TUI fzf\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it \"Jujutsu Kaisen\"{Colors.RESET}            "
+        f"Cerca direttamente un anime e apri la selezione\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it -c{Colors.RESET}                          "
+        f"Riprendi subito l'ultimo episodio dal punto esatto interrotto\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it -H{Colors.RESET}                          "
+        f"Apri la cronologia degli anime visti ([VISTO] / [IN CORSO])\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it -e 5 \"Chainsaw Man\"{Colors.RESET}         "
+        f"Avvia direttamente l'episodio 5 senza passare dal menu episodi\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it -q 720 \"Attack on Titan\"{Colors.RESET}    "
+        f"Forza la riproduzione video a risoluzione 720p\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it -t \"Steins;Gate\"{Colors.RESET}            "
+        f"Guarda nel terminale in HD automatico (Kitty / Sixel / TCT)\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it -t kitty \"Cyberpunk\"{Colors.RESET}        "
+        f"Forza grafica pixel HD 24-bit Kitty (Kitty, Ghostty, WezTerm)\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it -t sixel \"Bocchi\"{Colors.RESET}           "
+        f"Forza grafica pixel HD Sixel (Foot, WezTerm, XTerm)\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it -d -e 1-12 \"Frieren\"{Colors.RESET}        "
+        f"Scarica gli episodi da 1 a 12 in ~/Downloads/Anime/Frieren/\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it -d -e 1,3,5 \"DanDaDan\"{Colors.RESET}      "
+        f"Scarica solo gli episodi 1, 3 e 5\n"
+        f"  {Colors.BRIGHT_GREEN}ani-it -d -e all \"Evangelion\"{Colors.RESET}      "
+        f"Scarica l'intera serie in locale\n\n"
+        f"{Colors.BOLD}{Colors.BRIGHT_CYAN}CONTROLLI NEL MENU POST-RIPRODUZIONE:{Colors.RESET}\n"
+        f"  {Colors.BRIGHT_YELLOW}[Invio] / [n]{Colors.RESET} Prossimo episodio   "
+        f"{Colors.BRIGHT_YELLOW}[p]{Colors.RESET} Episodio precedente   "
+        f"{Colors.BRIGHT_YELLOW}[r]{Colors.RESET} Riavvia dall'inizio\n"
+        f"  {Colors.BRIGHT_YELLOW}[s]{Colors.RESET}           Cambia episodio     "
+        f"{Colors.BRIGHT_YELLOW}[d]{Colors.RESET} Scarica episodio      "
+        f"{Colors.BRIGHT_YELLOW}[q]{Colors.RESET} Esci dal programma\n\n"
+        f"{Colors.BOLD}{Colors.BRIGHT_CYAN}PERCORSI LOCALI (XDG):{Colors.RESET}\n"
+        f"  • Configurazione : {Colors.DIM}~/.config/ani-it/config.toml{Colors.RESET}\n"
+        f"  • Cronologia     : {Colors.DIM}~/.local/state/ani-it/history.json{Colors.RESET}\n"
+        f"  • Cache          : {Colors.DIM}~/.cache/ani-it/{Colors.RESET}\n"
+        f"  • Download       : {Colors.DIM}~/Downloads/Anime/{Colors.RESET}"
+    )
+
     parser = argparse.ArgumentParser(
         prog=APP_NAME,
-        description=f"{Colors.BOLD}{Colors.BRIGHT_CYAN}ani-it v{APP_VERSION}{Colors.RESET} - "
-        f"Client CLI/TUI nativo per AnimeUnity su Arch Linux.",
+        usage=f"{APP_NAME} [OPZIONI] [TITOLO_ANIME]",
+        description=description,
+        epilog=epilog,
         formatter_class=argparse.RawTextHelpFormatter,
         add_help=False,
     )
 
-    parser.add_argument(
-        "--help",
-        action="help",
-        help="Mostra questo messaggio di aiuto ed esce.",
+    search_group = parser.add_argument_group(
+        f"{Colors.BOLD}{Colors.BRIGHT_CYAN}RICERCA E SELEZIONE EPISODI{Colors.RESET}"
     )
-
-    parser.add_argument(
+    search_group.add_argument(
         "query",
         nargs="?",
         default=None,
-        help="Titolo dell'anime da cercare su AnimeUnity.",
+        help=(
+            "Titolo dell'anime da cercare su AnimeUnity.\n"
+            "Se omesso, viene aperto il prompt interattivo di ricerca."
+        ),
+    )
+    search_group.add_argument(
+        "-e",
+        "--episode",
+        dest="episode",
+        metavar="EPISODIO",
+        type=str,
+        default=None,
+        help=(
+            "Seleziona direttamente uno o più episodi:\n"
+            "  • Numero singolo : -e 5  oppure  -e 0  oppure  -e 12.5\n"
+            "  • Intervallo     : -e 1-12   (in modalità download -d)\n"
+            "  • Lista          : -e 1,3,5  (in modalità download -d)\n"
+            "  • Serie completa : -e all    (in modalità download -d)"
+        ),
     )
 
-    parser.add_argument(
+    history_group = parser.add_argument_group(
+        f"{Colors.BOLD}{Colors.BRIGHT_CYAN}CRONOLOGIA E RIPRESA VISIONE{Colors.RESET}"
+    )
+    history_group.add_argument(
         "-c",
         "--continue",
         dest="resume",
         action="store_true",
-        help="Riprendi immediatamente la visione dell'ultimo anime ed episodio.",
+        help=(
+            "Riprendi immediatamente l'ultimo anime guardato:\n"
+            "  • Se interrotto, riparte dal minuto/secondo esatto salvato.\n"
+            "  • Se completato, avvia automaticamente l'episodio successivo."
+        ),
     )
-
-    parser.add_argument(
+    history_group.add_argument(
         "-h",
         "-H",
         "--history",
         dest="history",
         action="store_true",
-        help="Mostra la cronologia degli anime visti con selezione rapida.",
+        help=(
+            "Apri il menu interattivo della cronologia con lo stato di avanzamento\n"
+            "di ogni serie ([VISTO], [IN CORSO], [NON VISTO])."
+        ),
     )
 
-    parser.add_argument(
-        "-d",
-        "--download",
-        dest="download",
-        action="store_true",
-        help="Attiva la modalità download con yt-dlp e aria2c.",
+    playback_group = parser.add_argument_group(
+        f"{Colors.BOLD}{Colors.BRIGHT_CYAN}QUALITÀ VIDEO E RIPRODUZIONE NEL TERMINALE{Colors.RESET}"
     )
-
-    parser.add_argument(
-        "-e",
-        "--episode",
-        dest="episode",
-        type=str,
-        default=None,
-        help="Seleziona direttamente un numero di episodio o un intervallo (es. 1 o 1-12).",
-    )
-
-    parser.add_argument(
+    playback_group.add_argument(
         "-q",
         "--quality",
         dest="quality",
+        metavar="QUALITÀ",
         type=str,
         choices=["1080", "1080p", "720", "720p", "480", "480p", "best"],
         default=None,
-        help="Forza una qualità video specifica (1080p, 720p, 480p, best).",
+        help=(
+            "Forza la risoluzione dello stream o del download.\n"
+            "Valori accettati: 1080p (o 1080), 720p (o 720), 480p (o 480), best [predefinito]."
+        ),
     )
-
-    parser.add_argument(
+    playback_group.add_argument(
         "-t",
         "--terminal",
         dest="terminal_vo",
+        metavar="DRIVER",
         nargs="?",
         const="auto",
         choices=["auto", "kitty", "sixel", "tct", "caca"],
         default=None,
-        help="Riproduci il video in alta risoluzione nel terminale ('auto', 'kitty', 'sixel', 'tct', 'caca').",
+        help=(
+            "Riproduci il video direttamente nel terminale (senza finestra esterna):\n"
+            "  • auto  : [predefinito] Rileva in automatico il protocollo HD migliore\n"
+            "  • kitty : Grafica pixel HD 24-bit + Shared Memory (Kitty, Ghostty, WezTerm, Konsole)\n"
+            "  • sixel : Grafica pixel HD Sixel con palette dinamica (Foot, WezTerm, XTerm)\n"
+            "  • tct   : Semiblocchi Unicode TrueColor RGB (universale per ogni terminale)\n"
+            "  • caca  : Modalità artistica in caratteri ASCII a colori"
+        ),
     )
 
-    parser.add_argument(
+    download_group = parser.add_argument_group(
+        f"{Colors.BOLD}{Colors.BRIGHT_CYAN}DOWNLOAD OFFLINE{Colors.RESET}"
+    )
+    download_group.add_argument(
+        "-d",
+        "--download",
+        dest="download",
+        action="store_true",
+        help=(
+            "Attiva la modalità download ad alta velocità (aria2c / yt-dlp).\n"
+            "Salva gli episodi in ~/Downloads/Anime/<Titolo>/ e riprende file parziali."
+        ),
+    )
+
+    maint_group = parser.add_argument_group(
+        f"{Colors.BOLD}{Colors.BRIGHT_CYAN}MANUTENZIONE E INFORMAZIONI{Colors.RESET}"
+    )
+    maint_group.add_argument(
         "--clear-history",
         action="store_true",
-        help="Svuota completamente il database della cronologia locale.",
+        help="Svuota completamente il database della cronologia locale (history.json).",
     )
-
-    parser.add_argument(
+    maint_group.add_argument(
         "--clear-cache",
         action="store_true",
-        help="Pulisce la cache delle locandine e dei metadati.",
+        help="Pulisce la cache locale delle locandine e dei metadati degli anime.",
     )
-
-    parser.add_argument(
+    maint_group.add_argument(
         "-v",
         "--version",
         action="version",
         version=f"%(prog)s {APP_VERSION}",
-        help="Stampa la versione del programma ed esce.",
+        help="Stampa la versione installata del programma ed esce.",
+    )
+    maint_group.add_argument(
+        "--help",
+        action="help",
+        help="Mostra questa guida completa dei comandi ed esce.",
     )
 
     # Flag interni per integrazione con fzf e shell completion

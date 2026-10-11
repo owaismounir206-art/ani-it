@@ -97,51 +97,65 @@ I valori non validi (tipo sbagliato, qualità sconosciuta, `base_url` senza `htt
 
 ---
 
-## 📖 Utilizzo
+## 📖 Utilizzo e Guida Completa ai Comandi
 
-### Ricerca ed Esecuzione Interattiva
+### 📋 Tabella di Riferimento dei Flag CLI
+
+| Opzione / Flag | Argomento | Descrizione Dettagliata |
+| :--- | :--- | :--- |
+| *(nessun flag)* | `[TITOLO]` | Cerca l'anime indicato su AnimeUnity (se omesso, apre il prompt interattivo) |
+| **`-e`, `--episode`** | `EPISODIO` | Seleziona un episodio singolo (`5`, `0`, `12.5`) oppure, con `-d`, un intervallo (`1-12`), una lista (`1,3,5`) o tutta la serie (`all`) |
+| **`-c`, `--continue`** | — | Riprende subito l'ultimo anime visto dal minuto/secondo esatto interrotto (o passa al successivo se completato) |
+| **`-h`, `-H`, `--history`** | — | Apre il menu interattivo della cronologia con lo stato di ogni serie (`[VISTO]`, `[IN CORSO]`, `[NON VISTO]`) |
+| **`-q`, `--quality`** | `1080p\|720p\|480p\|best` | Forza la qualità video dello streaming o del download (accetta anche `1080`, `720`, `480`) |
+| **`-t`, `--terminal`** | `[auto\|kitty\|sixel\|tct\|caca]` | Riproduce il video in alta risoluzione direttamente nel terminale senza finestra esterna (`auto` rileva automaticamente Kitty o Sixel HD) |
+| **`-d`, `--download`** | — | Scarica gli episodi in `~/Downloads/Anime/<Titolo>/` tramite `aria2c` / `yt-dlp` con ripresa automatica dei file parziali |
+| **`--clear-history`** | — | Cancella completamente il database locale della cronologia (`history.json`) |
+| **`--clear-cache`** | — | Svuota la cache locale delle locandine e dei metadati degli anime |
+| **`-v`, `--version`** | — | Stampa la versione installata di `ani-it` ed esce |
+| **`--help`** | — | Mostra la guida completa con tutte le opzioni e gli esempi |
+
+---
+
+### 💡 Esempi Pratici per Ogni Comando
+
 ```bash
-# Cerca un anime e apri il selettore TUI interattivo fzf
+# 1. Ricerca interattiva (apre direttamente il prompt oppure cerca subito un titolo)
+ani-it
 ani-it "Chainsaw Man"
 
-# Cerca senza query iniziale (apre direttamente il prompt)
-ani-it
-```
-
-### Scorciatoie e Modalità Speciali
-```bash
-# Riprendi l'ultimo anime: dall'episodio interrotto (alla posizione salvata)
-# oppure dal successivo se l'ultimo era finito
+# 2. Riprendi l'ultimo anime dal punto esatto in cui avevi interrotto
 ani-it -c
 ani-it --continue
 
-# Mostra la cronologia degli anime guardati con avanzamento
-# (-h è un alias di -H; l'aiuto si ottiene solo con --help)
+# 3. Apri la cronologia degli anime guardati con stato di avanzamento
 ani-it -H
 ani-it --history
 
-# Modalità download per una serie
-ani-it -d "Frieren"
-
-# Seleziona direttamente un episodio (per numero reale; in download anche intervalli)
+# 4. Avvia direttamente un episodio specifico (senza passare dal selettore episodi)
 ani-it -e 5 "Jujutsu Kaisen"
-ani-it -d -e 1-12 "Frieren"
 
-# Forza una risoluzione specifica (es. 720p, 1080p, best)
+# 5. Forza una risoluzione video specifica (1080p, 720p, 480p, best)
 ani-it -q 720 "Attack on Titan"
 
-# Riproduzione video in alta risoluzione direttamente nel terminale (senza finestra grafica esterna)
+# 6. Riproduzione video in Alta Risoluzione dentro il terminale (senza finestra esterna)
 ani-it -t "Steins;Gate"         # Rilevamento automatico HD ('kitty' su Kitty/Ghostty/WezTerm, 'sixel' su Foot, fallback 'tct')
 ani-it -t kitty "Cyberpunk"     # Grafica pixel HD 24-bit Kitty con Shared Memory (per Kitty, Ghostty, WezTerm, Konsole)
 ani-it -t sixel "Bocchi"        # Grafica pixel HD Sixel con palette dinamica (per Foot, WezTerm, XTerm)
 ani-it -t tct "Evangelion"      # Semiblocchi Unicode TrueColor RGB (universale)
 ani-it -t caca "Lain"           # Modalità ASCII color art
 
-# Pulizia dei dati
-ani-it --clear-history   # Azzera la cronologia
-ani-it --clear-cache     # Pulisce la cache delle immagini e dei metadati
-ani-it --version         # Stampa la versione installata (senza creare file)
-ani-it --help            # Mostra l'aiuto
+# 7. Download di episodi singoli, intervalli, liste o intere serie
+ani-it -d "Frieren"             # Chiede interattivamente quali episodi scaricare
+ani-it -d -e 1-12 "Frieren"     # Scarica gli episodi da 1 a 12
+ani-it -d -e 1,3,5 "DanDaDan"   # Scarica solo gli episodi 1, 3 e 5
+ani-it -d -e all "Evangelion"   # Scarica tutti gli episodi disponibili
+
+# 8. Manutenzione e informazioni
+ani-it --clear-history          # Azzera la cronologia
+ani-it --clear-cache            # Pulisce la cache delle locandine e dei metadati
+ani-it --version                # Stampa la versione installata
+ani-it --help                   # Mostra la guida completa nel terminale
 ```
 
 ### Episodi e cronologia
